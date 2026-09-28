@@ -135,6 +135,7 @@ struct ExonRow {
     n_edits: usize,
     via_denovo: bool,
     provenance: String,
+    phase: usize,
 }
 
 struct EditRow {
@@ -251,6 +252,7 @@ fn main() -> Result<()> {
                                 species: key.species.clone(), organelle: key.organelle.clone(), gene: key.gene.clone(),
                                 slot: e.slot, contig: e.contig.clone(), start: e.start, end: e.end, strand: e.strand,
                                 score: e.score, n_edits: e.edits.len(), via_denovo: e.via_denovo, provenance: e.provenance.clone(),
+                                phase: e.phase,
                             }).collect();
                             let junction_rows = outcome.junctions.iter().map(|j| JunctionRow {
                                 species: key.species.clone(), organelle: key.organelle.clone(), gene: key.gene.clone(),
@@ -309,13 +311,13 @@ fn write_outputs(
     fs::write(&tmp, g)?;
     fs::rename(&tmp, genes_out)?;
 
-    let mut e = String::from("species\torganelle\tgene\tslot\tcontig\tstart\tend\tstrand\tscore\tn_edits\tvia_denovo\tprovenance\n");
+    let mut e = String::from("species\torganelle\tgene\tslot\tcontig\tstart\tend\tstrand\tscore\tn_edits\tvia_denovo\tprovenance\tphase\n");
     for (_, exon_rows, _, _) in results {
         for row in exon_rows {
             e.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\n",
                 row.species, row.organelle, row.gene, row.slot, row.contig, row.start, row.end, row.strand,
-                row.score, row.n_edits, row.via_denovo, row.provenance
+                row.score, row.n_edits, row.via_denovo, row.provenance, row.phase
             ));
         }
     }

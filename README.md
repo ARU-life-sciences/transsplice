@@ -37,6 +37,30 @@ whole-gene profile - see `Profile format` below and the per-slot
    strand-corrected, classify each junction cis/trans for this species
    specifically (never inherited from a reference topology - see below),
    and run one final whole-gene alignment pass for an aggregate score.
+6. **Refine junctions** (0.2.0) on the winning assignment. Slot profiles
+   cover each exon's full codons only, so a codon-aligned match is short
+   of the true exon by the bases of any codon split across a junction
+   (`exonN.frame`'s lead/trail). Those are added back, then each junction
+   between adjacent slots is fine-tuned - split-codon distribution, then
+   a one-codon shift either side - by whole-gene alignment score, with a
+   small bonus for group II intron ends (5' `GNGCG`, 3' `AY`) as a
+   tiebreak. A stop codon `orfedit` folds onto any exon but the last is
+   removed (after an internal exon that "codon" is intron sequence, and
+   edit-created stops - CGA/CAA/CAG - are common there).
+
+Before 0.2.0 split codons were dropped at every junction, frame-shifting
+the joined CDS downstream of the first phase-1/2 junction: on
+Arabidopsis thaliana (a training genome) nad2 came out 50% identical to
+its RefSeq protein despite all five exons being placed within 2 bp.
+0.2.0 gives nad1 90%, nad2 95%, nad5 95%, rps3 99% (the rest is mostly
+RNA-editing differences and the tiny-exon limitation below).
+
+**Known limitation - tiny exons.** A 7-19 codon exon (nad5 exon 3, 22 bp;
+nad1 exon 4, 59 bp) is too short for an upstream HMM search to hit and
+its profile too short to place it confidently de novo; its slot can end
+up filled from an unrelated fragment. A neighbourhood search around
+cis-adjacent exons was tried and did not fix it (a spurious hit nearby
+outscored the real exon).
 
 Critically: the algorithm never assumes a fixed cis/trans *pattern* per
 junction, only fixed exon *identity/order* - real reference genomes show
@@ -50,6 +74,9 @@ after assignment, never an input to it.
 
 Same PSSM format as `orfedit` (plain TSV, 20 amino acid columns, one row
 per alignment column) - a template directory holds `exon1.pssm`,
+optionally `exon1.frame` (`lead<TAB>trail`: bases of a split codon at the
+exon's 5'/3' end, 0-2 each; absent = 0/0 - profiles must then be built
+from the exon's in-frame full codons only),
 `exon1.threshold` (a `min_self_score` floor - not an invented cutoff, see
 usage below), `exon2.pssm`, ..., and `whole_gene.pssm`.
 
