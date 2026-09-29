@@ -2,7 +2,7 @@
 
 Reconstructs trans-spliced genes in plant mitochondrial genomes from
 scattered per-exon gene-model hits, reusing
-[`orfedit`](https://github.com/tolkit/orfedit)'s edit-tolerant alignment
+[`orfedit`](https://github.com/ARU-life-sciences/orfedit)'s edit-tolerant alignment
 engine.
 
 ## The problem

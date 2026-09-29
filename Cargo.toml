@@ -22,8 +22,10 @@ categories = ["command-line-utilities", "science"]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 rayon = "1.12.0"
-# `version` so `cargo publish` packages against the real crates.io release
-# (path deps alone can't be published); `path` so local dev builds still
-# use this workspace's copy. Bump the pinned version here whenever orfedit
-# is republished.
-orfedit = { version = "0.1.0", path = "../orfedit" }
+# From crates.io, so a build from this repo's release tarball (bioconda) is
+# self-contained. To build against a local orfedit checkout instead, add
+#   [patch.crates-io]
+#   orfedit = { path = "../orfedit" }
+# to an uncommitted .cargo/config.toml. Bump the pinned version here
+# whenever orfedit is republished.
+orfedit = "0.1.0"
