@@ -29,12 +29,15 @@ pub struct ExonResult {
     pub phase: usize,
 }
 
-/// Bonus added to the whole-gene score for each junction whose flanking
-/// intron sequence matches the group II intron consensus: 5' `GNGCG`
-/// (15/18 Arabidopsis mito cis introns) and 3' `AY`. Only ever a tiebreak
-/// between junction placements the protein alignment scores near-equally
-/// (a split codon's two readings often differ by one conservative residue).
-pub const SPLICE_MOTIF_BONUS: f64 = 2.0;
+/// Bonus added to the whole-gene score for each intron end matching the
+/// group II consensus: 5' `GNGCG` (15/18 Arabidopsis mito cis introns),
+/// 3' `AY`. Calibrated on Arabidopsis (nad1/2/4/5/7, ccmFc, cox2, rpl2,
+/// rps3 vs RefSeq): 2.0 got 9/32 exons base-exact - a split codon's two
+/// readings differ by one residue, and the profile often prefers the wrong
+/// one by more than a tiebreak; 20.0 got 21/32 and 40/100 changed nothing,
+/// with protein identity identical throughout (a chance motif within the
+/// few-bp refinement window is rare).
+pub const SPLICE_MOTIF_BONUS: f64 = 20.0;
 
 /// How far (in codons) each side of a junction may move from the
 /// codon-aligned exon match during junction refinement.
@@ -280,6 +283,22 @@ fn evaluate_assignment(
             via_denovo: denovo_candidate_indices.contains(&ci),
         });
     }
+
+    // Two slots can't be the same stretch of genome. Assignment only stops a
+    // candidate being reused, not two overlapping candidates (a fragment and
+    // a merged run containing it) filling different slots - seen with a
+    // short slot profile matching inside its neighbour's exon (Arabidopsis
+    // cox2 exon 2, 27 aa). Keep the better-scoring exon; the slot empties.
+    let mut dropped = vec![false; placed.len()];
+    for i in 0..placed.len() {
+        for j in (i + 1)..placed.len() {
+            let (a, b) = (&placed[i], &placed[j]);
+            if a.contig == b.contig && a.core_start < b.core_end && b.core_start < a.core_end {
+                if a.score >= b.score { dropped[j] = true } else { dropped[i] = true }
+            }
+        }
+    }
+    let placed: Vec<Placed> = placed.into_iter().zip(dropped).filter(|(_, d)| !d).map(|(p, _)| p).collect();
 
     // Junction refinement. Slot profiles cover whole codons only, so each
     // core is short of its true exon by the split-codon bases (template
@@ -551,6 +570,45 @@ mod tests {
         assert_eq!(outcome.protein, "MKVF");
         assert_eq!((outcome.exons[0].start, outcome.exons[0].end), (3, 9));
         assert!(outcome.exons[0].edits.iter().all(|e| e.resulting_aa != '*'));
+    }
+
+    #[test]
+    fn overlapping_candidates_never_fill_two_slots() {
+        // One exon ATG AAA GTT TTT (MKVF). Slot 2's short profile (VF) also
+        // matches *inside* it, via a second fragment covering its 3' half.
+        // Both slots must not claim the same bases.
+        let mut seq = b"CCC".to_vec();
+        seq.extend(b"ATGAAAGTTTTT"); // 3..15
+        seq.extend(b"CCCCCCCCCCCC");
+        let mut sequences = HashMap::new();
+        sequences.insert("ctg1".to_string(), seq);
+        let fasta_idx = FastaIndex { sequences };
+        let template = GeneTemplate {
+            gene: "test".to_string(),
+            slots: vec![
+                SlotTemplate {
+                    profile: custom_profile("e1", &[&[(b'M', 10.0)], &[(b'K', 10.0)], &[(b'V', 10.0)], &[(b'F', 10.0)]]),
+                    min_self_score: -100.0, lead: 0, trail: 0,
+                },
+                SlotTemplate {
+                    profile: custom_profile("e2", &[&[(b'V', 10.0)], &[(b'F', 10.0)]]),
+                    min_self_score: -100.0, lead: 0, trail: 0,
+                },
+            ],
+            whole_gene_profile: custom_profile("whole", &[&[(b'M', 10.0)], &[(b'K', 10.0)], &[(b'V', 10.0)], &[(b'F', 10.0)]]),
+        };
+        let fragments = vec![
+            RawFragment { contig: "ctg1".to_string(), start: 3, end: 15, strand: '+' },
+            RawFragment { contig: "ctg1".to_string(), start: 9, end: 15, strand: '+' },
+        ];
+        let outcome = reconstruct_gene(&fasta_idx, &fragments, &template, &ScanParams::default(), 0, 1000, 0).unwrap();
+        for (i, a) in outcome.exons.iter().enumerate() {
+            for b in &outcome.exons[i + 1..] {
+                assert!(!(a.contig == b.contig && a.start < b.end && b.start < a.end), "exons overlap: {:?}-{:?}",
+                        (a.start, a.end), (b.start, b.end));
+            }
+        }
+        assert_eq!(outcome.protein, "MKVF");
     }
 
     fn custom_profile(gene: &str, columns: &[&[(u8, f64)]]) -> Profile {

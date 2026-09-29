@@ -42,11 +42,21 @@ whole-gene profile - see `Profile format` below and the per-slot
    of the true exon by the bases of any codon split across a junction
    (`exonN.frame`'s lead/trail). Those are added back, then each junction
    between adjacent slots is fine-tuned - split-codon distribution, then
-   a one-codon shift either side - by whole-gene alignment score, with a
-   small bonus for group II intron ends (5' `GNGCG`, 3' `AY`) as a
-   tiebreak. A stop codon `orfedit` folds onto any exon but the last is
-   removed (after an internal exon that "codon" is intron sequence, and
-   edit-created stops - CGA/CAA/CAG - are common there).
+   a one-codon shift either side - by whole-gene alignment score plus a
+   bonus for each group II intron end (5' `GNGCG`, 3' `AY`). A stop codon
+   `orfedit` folds onto any exon but the last is removed (after an
+   internal exon that "codon" is intron sequence, and edit-created stops -
+   CGA/CAA/CAG - are common there).
+
+0.2.1: the intron-motif bonus is 20 (was 2). A split codon's two readings
+differ by one residue and the profile often prefers the wrong one by more
+than a tiebreak; calibrated on Arabidopsis (nad1/2/4/5/7, ccmFc, cox2,
+rpl2, rps3 vs RefSeq) exons placed base-exact went 9/32 -> 21/32 (40 and
+100 changed nothing; protein identity unchanged). Also: two slots can no
+longer be filled by overlapping candidates (a short slot profile had
+matched inside its neighbour's exon - Arabidopsis cox2); the lower-scoring
+one's slot is left empty. Works for cis-spliced genes unchanged - the
+junction classifier never assumed trans.
 
 Before 0.2.0 split codons were dropped at every junction, frame-shifting
 the joined CDS downstream of the first phase-1/2 junction: on
