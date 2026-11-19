@@ -50,6 +50,15 @@ enum Command {
         gap_extend: f64,
         #[arg(long, default_value_t = 2.5)]
         edit_penalty: f64,
+        /// Cost of a U-to-C ("reverse") RNA edit; "inf", the default, for
+        /// C-to-U editing only. Give a finite cost for ferns, lycophytes
+        /// and hornworts (see orfedit)
+        #[arg(long, default_value_t = f64::INFINITY)]
+        reverse_edit_penalty: f64,
+        /// Cost of reading a genomic in-frame stop codon as Gln or Arg by a
+        /// U-to-C edit; "inf", the default, for none (see orfedit)
+        #[arg(long, default_value_t = f64::INFINITY)]
+        stop_edit_penalty: f64,
         #[arg(long, default_value_t = 5000)]
         merge_distance: i64,
         #[arg(long, default_value_t = 10000)]
@@ -153,6 +162,7 @@ struct EditRow {
     genomic_pos: usize,
     profile_column: usize,
     resulting_aa: char,
+    reverse: bool,
 }
 
 struct JunctionRow {
@@ -178,6 +188,8 @@ fn main() -> Result<()> {
             gap_open,
             gap_extend,
             edit_penalty,
+            reverse_edit_penalty,
+            stop_edit_penalty,
             merge_distance,
             junction_distance_threshold,
             exon_flank,
@@ -234,7 +246,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            let params = ScanParams { gap_open, gap_extend, edit_penalty, flank: 0, frameshift_penalty, ..ScanParams::default() };
+            let params = ScanParams { gap_open, gap_extend, edit_penalty, reverse_edit_penalty, stop_edit_penalty, flank: 0, frameshift_penalty, ..ScanParams::default() };
             let mut group_vec: Vec<(&GroupKey, &Vec<&ManifestRow>)> = groups.iter().collect();
             group_vec.sort_by(|a, b| a.0.cmp(b.0)); // stable output row order
 
@@ -323,7 +335,7 @@ fn main() -> Result<()> {
                                 e.edits.iter().map(move |ed| EditRow {
                                     species: key.species.clone(), organelle: key.organelle.clone(), gene: key.gene.clone(),
                                     slot: e.slot, genomic_pos: ed.genomic_pos, profile_column: ed.profile_column,
-                                    resulting_aa: ed.resulting_aa,
+                                    resulting_aa: ed.resulting_aa, reverse: ed.reverse,
                                 })
                             }).collect();
                             let shift_rows = outcome.frameshifts.iter().map(|f| format!(
@@ -418,12 +430,13 @@ fn write_outputs(
     fs::write(&tmp, j)?;
     fs::rename(&tmp, junctions_out)?;
 
-    let mut ed = String::from("species\torganelle\tgene\tslot\tgenomic_pos\tprofile_column\tresulting_aa\n");
+    let mut ed = String::from("species\torganelle\tgene\tslot\tgenomic_pos\tprofile_column\tresulting_aa\tedit\n");
     for (_, _, _, edit_rows, _) in results {
         for row in edit_rows {
             ed.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                row.species, row.organelle, row.gene, row.slot, row.genomic_pos, row.profile_column, row.resulting_aa
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                row.species, row.organelle, row.gene, row.slot, row.genomic_pos, row.profile_column, row.resulting_aa,
+                if row.reverse { "U>C" } else { "C>U" }
             ));
         }
     }

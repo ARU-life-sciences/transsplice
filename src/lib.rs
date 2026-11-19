@@ -21,7 +21,7 @@ struct ScanSummary {
     corrected_start: usize,
     corrected_end: usize,
     includes_stop: bool,
-    edits: Vec<(usize, usize, char)>, // genomic_pos, profile_column, resulting_aa
+    edits: Vec<(usize, usize, char, bool)>, // genomic_pos, profile_column, resulting_aa, reverse
 }
 
 impl ScanSummary {
@@ -31,7 +31,7 @@ impl ScanSummary {
             corrected_start: o.corrected_start,
             corrected_end: o.corrected_end,
             includes_stop: o.includes_stop,
-            edits: o.edits.iter().map(|e| (e.genomic_pos, e.profile_column, e.resulting_aa)).collect(),
+            edits: o.edits.iter().map(|e| (e.genomic_pos, e.profile_column, e.resulting_aa, e.reverse)).collect(),
         }
     }
 }
@@ -679,7 +679,7 @@ fn evaluate_assignment(
         let mut edits: Vec<orfedit::EditCall> = outcome
             .edits
             .iter()
-            .map(|&(genomic_pos, profile_column, resulting_aa)| orfedit::EditCall { genomic_pos, profile_column, resulting_aa })
+            .map(|&(genomic_pos, profile_column, resulting_aa, reverse)| orfedit::EditCall { genomic_pos, profile_column, resulting_aa, reverse })
             .collect();
         // scan_gene folds in a following stop codon (possibly edit-created).
         // Only the gene's last exon ends in one; after any other exon that
@@ -765,7 +765,7 @@ fn evaluate_assignment(
             &concat,
             params.gap_open,
             params.gap_extend,
-            params.edit_penalty,
+            params.edit_costs(),
             params.frameshift_penalty,
         );
         cache.whole_scores.borrow_mut().insert(concat, s);
@@ -851,7 +851,7 @@ fn evaluate_assignment(
             concat.extend(seq);
         }
         let align_whole = |penalty: f64| {
-            align_nt_frame0(&template.whole_gene_profile, &concat, params.gap_open, params.gap_extend, params.edit_penalty, penalty)
+            align_nt_frame0(&template.whole_gene_profile, &concat, params.gap_open, params.gap_extend, params.edit_costs(), penalty)
         };
         let mut whole = align_whole(params.frameshift_penalty);
         cache.whole_scores.borrow_mut().entry(concat.clone()).or_insert(whole.score);
@@ -864,7 +864,7 @@ fn evaluate_assignment(
     // Gene ends (the chosen assignment only): start the first exon at the
     // start codon and end the last at the stop codon, then align again.
     if refine_junctions && !exons.is_empty() {
-        let (start_trim, end_change) = terminal_adjustment(fasta_idx, template, &exons, &concat, &offsets, &whole);
+        let (start_trim, end_change) = terminal_adjustment(fasta_idx, template, &exons, &concat, &offsets, &whole, params.edit_costs().reverse());
         let mut changed = false;
         if start_trim > 0 {
             let e = &mut exons[0];
@@ -973,6 +973,7 @@ fn terminal_adjustment(
     concat: &[u8],
     offsets: &[(usize, usize)],
     whole: &orfedit::align::NtAlignResult,
+    reverse_editing: bool,
 ) -> (usize, i64) {
     let profile = &template.whole_gene_profile;
     let n_columns = profile.len();
@@ -1028,6 +1029,12 @@ fn terminal_adjustment(
                     break 'search;
                 }
             }
+        }
+        // With U->C editing a stop codon inside the gene may be a residue
+        // the alignment chose not to read (the edit cost more than the
+        // column was worth): it says nothing about where the gene ends.
+        if reverse_editing {
+            interior = None;
         }
         if let Some((q, column)) = interior {
             // an early stop is a pseudogene's (or needs reverse editing):

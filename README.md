@@ -148,8 +148,22 @@ from 9,373 to 9,792 of 9,954; genes with a frameshift call fall from
 1,521 to 1,004 (mito) and 362 to 98 (plastid; rps12 136 to 0). These
 are with `poa`'s slot floors at a quarter of the lowest reference
 self-score; at half, as they were, divergent lineages on the angiosperm
-templates (ferns, lycophytes) lost most of their exons. A full mito run
-takes 17 minutes at 16 threads (13 before the searches for short exons).
+templates (ferns, lycophytes) lost most of their exons, and at 0.075,
+where poa now has them, mito is 7,423 complete and 762 with a call. A
+full mito run takes 17 minutes at 16 threads (13 before the searches for
+short exons).
+
+Reverse editing. `--stop-edit-penalty` and `--reverse-edit-penalty` (both
+`inf`, off, by default) are orfedit's: the cost of reading a genomic
+in-frame stop codon as Gln or Arg by a U-to-C edit, and of any other
+U-to-C edit; see orfedit's README for why they are separate and how they
+were calibrated. They apply to every exon scan and to the whole-gene
+alignment, and with either on, a stop codon inside the last exon no
+longer ends the gene there. For ferns, quillworts and hornworts: on 249
+spliced mito genes from 30 DToL fern assemblies, `--stop-edit-penalty
+2.5` takes genes aligned over 99% of their profile from 0 to 80, and
+plastid ones from 74 to 117 of 233. With both off the output is
+unchanged. The edits table has an `edit` column, `C>U` or `U>C`.
 
 Still wrong: a gene whose exon count differs from the template's (cox2
 with one intron or two; an intron lost so two template exons are one
