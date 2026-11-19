@@ -39,6 +39,9 @@ enum Command {
         junctions_out: PathBuf,
         #[arg(long)]
         edits_out: PathBuf,
+        /// Also write one row per frameshift found in a reconstructed gene
+        #[arg(long)]
+        frameshifts_out: Option<PathBuf>,
         #[arg(long, default_value_t = 4)]
         threads: usize,
         #[arg(long, default_value_t = 8.0)]
@@ -53,6 +56,10 @@ enum Command {
         junction_distance_threshold: i64,
         #[arg(long, default_value_t = 60)]
         exon_flank: i64,
+        /// Cost of a frame change (skipping 1 or 2 bases) inside a gene;
+        /// "inf" keeps every exon and the joined CDS in one reading frame
+        #[arg(long, default_value_t = 20.0)]
+        frameshift_penalty: f64,
     },
 }
 
@@ -174,6 +181,8 @@ fn main() -> Result<()> {
             merge_distance,
             junction_distance_threshold,
             exon_flank,
+            frameshifts_out,
+            frameshift_penalty,
         } => {
             rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().ok();
 
@@ -225,10 +234,10 @@ fn main() -> Result<()> {
                 }
             }
 
-            let params = ScanParams { gap_open, gap_extend, edit_penalty, flank: 0 };
+            let params = ScanParams { gap_open, gap_extend, edit_penalty, flank: 0, frameshift_penalty, ..ScanParams::default() };
             let group_vec: Vec<(&GroupKey, &Vec<&ManifestRow>)> = groups.iter().collect();
 
-            let results: Vec<(GeneRow, Vec<ExonRow>, Vec<JunctionRow>, Vec<EditRow>)> = group_vec
+            let results: Vec<(GeneRow, Vec<ExonRow>, Vec<JunctionRow>, Vec<EditRow>, Vec<String>)> = group_vec
                 .par_iter()
                 .filter_map(|(key, frags)| {
                     let template = templates.get(&key.template_dir)?;
@@ -265,7 +274,12 @@ fn main() -> Result<()> {
                                     resulting_aa: ed.resulting_aa,
                                 })
                             }).collect();
-                            Some((gene_row, exon_rows, junction_rows, edit_rows))
+                            let shift_rows = outcome.frameshifts.iter().map(|f| format!(
+                                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                                key.species, key.organelle, key.gene, f.slot, f.contig, f.start, f.end, f.n_bases,
+                                f.profile_column, f.window_start, f.window_end
+                            )).collect();
+                            Some((gene_row, exon_rows, junction_rows, edit_rows, shift_rows))
                         }
                         Err(e) => {
                             eprintln!("[warn] transsplice: {} {} {}: {:#}", key.species, key.organelle, key.gene, e);
@@ -276,10 +290,24 @@ fn main() -> Result<()> {
                 .collect();
 
             write_outputs(&genes_out, &exons_out, &junctions_out, &edits_out, &results)?;
-            let n_complete = results.iter().filter(|(g, _, _, _)| g.complete).count();
+            if let Some(path) = &frameshifts_out {
+                let mut w = String::from(
+                    "species\torganelle\tgene\tslot\tcontig\tstart\tend\tn_bases\tprofile_column\twindow_start\twindow_end\n",
+                );
+                for (_, _, _, _, rows) in &results {
+                    rows.iter().for_each(|r| w.push_str(r));
+                }
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let tmp = path.with_extension("tsv.tmp");
+                fs::write(&tmp, w)?;
+                fs::rename(&tmp, path)?;
+            }
+            let n_complete = results.iter().filter(|(g, ..)| g.complete).count();
             eprintln!(
-                "[info] transsplice: {} genes reconstructed, {} complete -> {}",
-                results.len(), n_complete, genes_out.display()
+                "[info] transsplice: {} genes reconstructed, {} complete, {} with frameshifts -> {}",
+                results.len(), n_complete, results.iter().filter(|r| !r.4.is_empty()).count(), genes_out.display()
             );
             Ok(())
         }
@@ -291,7 +319,7 @@ fn write_outputs(
     exons_out: &PathBuf,
     junctions_out: &PathBuf,
     edits_out: &PathBuf,
-    results: &[(GeneRow, Vec<ExonRow>, Vec<JunctionRow>, Vec<EditRow>)],
+    results: &[(GeneRow, Vec<ExonRow>, Vec<JunctionRow>, Vec<EditRow>, Vec<String>)],
 ) -> Result<()> {
     for p in [genes_out, exons_out, junctions_out, edits_out] {
         if let Some(parent) = p.parent() {
@@ -300,7 +328,7 @@ fn write_outputs(
     }
 
     let mut g = String::from("species\torganelle\tgene\tn_slots\tn_filled\tcomplete\twhole_gene_score\twhole_gene_n_edits\tprotein\n");
-    for (row, _, _, _) in results {
+    for (row, ..) in results {
         g.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\n",
             row.species, row.organelle, row.gene, row.n_slots, row.n_filled, row.complete,
@@ -312,7 +340,7 @@ fn write_outputs(
     fs::rename(&tmp, genes_out)?;
 
     let mut e = String::from("species\torganelle\tgene\tslot\tcontig\tstart\tend\tstrand\tscore\tn_edits\tvia_denovo\tprovenance\tphase\n");
-    for (_, exon_rows, _, _) in results {
+    for (_, exon_rows, ..) in results {
         for row in exon_rows {
             e.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\n",
@@ -326,7 +354,7 @@ fn write_outputs(
     fs::rename(&tmp, exons_out)?;
 
     let mut j = String::from("species\torganelle\tgene\tfrom_slot\tto_slot\tkind\tgap_bp\n");
-    for (_, _, junction_rows, _) in results {
+    for (_, _, junction_rows, ..) in results {
         for row in junction_rows {
             j.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -339,7 +367,7 @@ fn write_outputs(
     fs::rename(&tmp, junctions_out)?;
 
     let mut ed = String::from("species\torganelle\tgene\tslot\tgenomic_pos\tprofile_column\tresulting_aa\n");
-    for (_, _, _, edit_rows) in results {
+    for (_, _, _, edit_rows, _) in results {
         for row in edit_rows {
             ed.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",

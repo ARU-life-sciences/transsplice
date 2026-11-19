@@ -65,12 +65,35 @@ its RefSeq protein despite all five exons being placed within 2 bp.
 0.2.0 gives nad1 90%, nad2 95%, nad5 95%, rps3 99% (the rest is mostly
 RNA-editing differences and the tiny-exon limitation below).
 
+0.3.0: frameshifts. With orfedit 0.2.0's frame-change alignment, each
+exon's scan and the whole-gene pass over the joined exons may change
+reading frame (`--frameshift-penalty`, default 20; `inf` for none), so
+an exon with an indel is still placed whole and the joined CDS aligned
+through it. Each frame change in the whole-gene alignment is mapped back
+to its exon and genomic position and written to `--frameshifts-out`
+(`slot`, `contig`, `start`/`end` of the 1 or 2 skipped bases, `n_bases`,
+whole-gene `profile_column`, and `window_start`/`window_end`, the
+stretch it could equally well sit in, clipped to the exon). A frame
+change within 3 bp of an exon end is taken as the junction being a base
+or two off, not reported. The joined exons are now aligned in frame 0
+only (0.2.1 let that alignment start in any of the three frames), which
+changes results even with `inf`: on the 8,993 DToL mito genes, 528
+differ from 0.2.1, all nad5 bar four; 174 nad5 become complete (none
+stop being complete), and the median number of profile columns left
+unaligned in the changed proteins falls from 50 to 1. Works for any
+organelle's templates: `poa` builds plastid ones (atpF, clpP, ndhA,
+ndhB, rpl2, rpoC1, rps12, rps16, ycf3) from 13 RefSeq plastomes.
+
 **Known limitation - tiny exons.** A 7-19 codon exon (nad5 exon 3, 22 bp;
 nad1 exon 4, 59 bp) is too short for an upstream HMM search to hit and
 its profile too short to place it confidently de novo; its slot can end
 up filled from an unrelated fragment. A neighbourhood search around
 cis-adjacent exons was tried and did not fix it (a spurious hit nearby
-outscored the real exon).
+outscored the real exon). The same goes for plastid rps16 exon 1 (13
+codons) and rps12 exon 3: on Arabidopsis, rps16 exon 1 is placed ~80 bp
+off within its own HMM hit's scan window (protein 0.85 identical to
+RefSeq) and rps12 exon 3 is filled from elsewhere (0.94); the other seven
+plastid genes come out 0.99-1.00.
 
 Critically: the algorithm never assumes a fixed cis/trans *pattern* per
 junction, only fixed exon *identity/order* - real reference genomes show

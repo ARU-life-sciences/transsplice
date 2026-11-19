@@ -5,10 +5,9 @@ pub mod template;
 use anyhow::{Context, Result};
 use assign::{best_assignment, best_assignments_beam, classify_junction, Assignment};
 use candidate::{build_candidates, Candidate, RawFragment};
-use orfedit::align::{align, ColumnCall};
-use orfedit::codon::AA_ORDER;
-use orfedit::fasta::{codons_for_frame, FastaIndex};
-use orfedit::{scan_gene, ScanParams};
+use orfedit::align::{NtColumnCall, align_nt_frame0};
+use orfedit::fasta::FastaIndex;
+use orfedit::{frameshifts_supported, scan_gene, ScanParams};
 use template::GeneTemplate;
 
 pub struct ExonResult {
@@ -99,6 +98,27 @@ fn splice_motif_bonus(fasta_idx: &FastaIndex, a: &Placed, a_span: (i64, i64), b:
     bonus
 }
 
+/// A change of reading frame inside the reconstructed CDS (see orfedit's
+/// frameshifts): the 1 or 2 bases skipped, on exon `slot`, genomic 0-based
+/// half-open [start, end), before whole-gene profile column `profile_column`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneFrameshift {
+    pub slot: usize,
+    pub contig: String,
+    pub start: usize,
+    pub end: usize,
+    pub n_bases: usize,
+    pub profile_column: usize,
+    /// Genomic [start, end) the frame change could equally well sit in
+    /// (orfedit's frameshift window), clipped to the exon.
+    pub window_start: usize,
+    pub window_end: usize,
+}
+
+/// A frame change this close (bases) to an exon end is taken as the
+/// junction being placed a base or two off, not a frameshift in the exon.
+const FRAMESHIFT_JUNCTION_MARGIN: usize = 3;
+
 pub struct JunctionResult {
     pub from_slot: usize,
     pub to_slot: usize,
@@ -115,6 +135,7 @@ pub struct ReconstructionOutcome {
     pub whole_gene_score: f64,
     pub whole_gene_n_edits: usize,
     pub protein: String,
+    pub frameshifts: Vec<GeneFrameshift>,
 }
 
 /// Reconstruct one (species, gene) call from its raw `.ctg.bed` fragments.
@@ -205,7 +226,7 @@ pub fn reconstruct_gene(
     // alignments), which fine-tunes boundaries rather than changing which
     // candidates are exons.
     let beam = best_assignments_beam(&scores, &floors, 2);
-    let mut best: Option<(usize, (Vec<ExonResult>, Vec<JunctionResult>, f64, usize, String))> = None;
+    let mut best: Option<(usize, Evaluated)> = None;
     for (bi, candidate_assignment) in beam.iter().enumerate() {
         let Ok(result) = evaluate_assignment(
             fasta_idx, &candidates, template, candidate_assignment, &exon_params, params,
@@ -218,7 +239,7 @@ pub fn reconstruct_gene(
         }
     }
     let (bi, unrefined) = best.context("no candidate assignment (not even the empty one) produced a result")?;
-    let (exons, junctions, whole_gene_score, whole_gene_n_edits, protein) = evaluate_assignment(
+    let (exons, junctions, whole_gene_score, whole_gene_n_edits, protein, frameshifts) = evaluate_assignment(
         fasta_idx, &candidates, template, &beam[bi], &exon_params, params,
         &denovo_candidate_indices, junction_distance_threshold, true,
     )
@@ -233,8 +254,11 @@ pub fn reconstruct_gene(
         whole_gene_score,
         whole_gene_n_edits,
         protein,
+        frameshifts,
     })
 }
+
+type Evaluated = (Vec<ExonResult>, Vec<JunctionResult>, f64, usize, String, Vec<GeneFrameshift>);
 
 /// Build the exon list, junction classifications, and whole-gene alignment
 /// for one candidate assignment - the thing `reconstruct_gene`'s beam
@@ -250,7 +274,7 @@ fn evaluate_assignment(
     denovo_candidate_indices: &std::collections::HashSet<usize>,
     junction_distance_threshold: i64,
     refine_junctions: bool,
-) -> Result<(Vec<ExonResult>, Vec<JunctionResult>, f64, usize, String)> {
+) -> Result<Evaluated> {
     let k = template.slots.len();
     let mut placed: Vec<Placed> = Vec::new();
     for (si, slot) in template.slots.iter().enumerate() {
@@ -327,8 +351,15 @@ fn evaluate_assignment(
         concat
     };
     let score_of = |ext5: &[i64], ext3: &[i64]| -> f64 {
-        let codons = codons_for_frame(&concat_of(ext5, ext3), 0);
-        align(&template.whole_gene_profile, &codons, params.gap_open, params.gap_extend, params.edit_penalty).score
+        align_nt_frame0(
+            &template.whole_gene_profile,
+            &concat_of(ext5, ext3),
+            params.gap_open,
+            params.gap_extend,
+            params.edit_penalty,
+            params.frameshift_penalty,
+        )
+        .score
     };
     let junction_bonus = |i: usize, ext5: &[i64], ext3: &[i64]| -> f64 {
         let (a, b) = (&placed[i], &placed[i + 1]);
@@ -404,30 +435,67 @@ fn evaluate_assignment(
     // Whole-gene pass: concatenate the corrected exon sequences (in slot
     // order, each already strand-corrected/frame-trimmed by its own
     // scan_gene call above) and align once against the whole-gene profile -
-    // this is the arbiter the beam search picks an assignment by.
+    // this is the arbiter the beam search picks an assignment by. Frame
+    // changes are allowed (params.frameshift_penalty) and kept only with
+    // sound alignment either side (orfedit::frameshifts_supported), as in
+    // orfedit's own single-exon scan.
     let mut concat: Vec<u8> = Vec::new();
-    for e in &exons {
+    let mut offsets = Vec::with_capacity(exons.len()); // (concat start, exon index)
+    for (i, e) in exons.iter().enumerate() {
         let (_, _, seq) = fasta_idx.extract_window(&e.contig, e.start as i64, e.end as i64, e.strand)?;
+        offsets.push((concat.len(), i));
         concat.extend(seq);
     }
-    let codons = codons_for_frame(&concat, 0);
-    let whole = align(&template.whole_gene_profile, &codons, params.gap_open, params.gap_extend, params.edit_penalty);
+    let align_whole = |penalty: f64| {
+        align_nt_frame0(&template.whole_gene_profile, &concat, params.gap_open, params.gap_extend, params.edit_penalty, penalty)
+    };
+    let mut whole = align_whole(params.frameshift_penalty);
+    if !whole.frameshifts.is_empty() && !frameshifts_supported(&template.whole_gene_profile, &whole, params) {
+        whole = align_whole(f64::INFINITY);
+    }
     let mut protein = String::with_capacity(whole.columns.len());
     let mut whole_gene_n_edits = 0usize;
     for call in &whole.columns {
         match call {
-            ColumnCall::Aligned { aa, n_edits, .. } => {
+            NtColumnCall::Aligned { aa, n_edits, .. } => {
                 protein.push(*aa as char);
                 if *n_edits > 0 {
                     whole_gene_n_edits += 1;
                 }
             }
-            ColumnCall::Deleted => protein.push('-'),
+            NtColumnCall::Deleted => protein.push('-'),
         }
     }
-    let _ = AA_ORDER; // re-exported for downstream convenience if needed
+    let mut frameshifts = Vec::new();
+    for f in &whole.frameshifts {
+        // the exon holding the skipped bases, and their offset within it
+        let Some(&(off, i)) = offsets.iter().rev().find(|(o, _)| *o <= f.sense_pos) else { continue };
+        let e = &exons[i];
+        let local = f.sense_pos - off;
+        let len = e.end - e.start;
+        if local < FRAMESHIFT_JUNCTION_MARGIN || local + f.n_bases + FRAMESHIFT_JUNCTION_MARGIN > len {
+            continue;
+        }
+        // concat offsets [a, b) within this exon -> genomic [start, end)
+        let to_genomic = |a: usize, b: usize| -> (usize, usize) {
+            if e.strand == '-' { (e.end - b, e.end - a) } else { (e.start + a, e.start + b) }
+        };
+        let (start, end) = to_genomic(local, local + f.n_bases);
+        let (wa, wb) = (f.window.0.max(off) - off, (f.window.1 - off).min(len));
+        let (window_start, window_end) = to_genomic(wa.min(local), wb.max(local + f.n_bases));
+        frameshifts.push(GeneFrameshift {
+            slot: e.slot,
+            contig: e.contig.clone(),
+            start,
+            end,
+            n_bases: f.n_bases,
+            profile_column: f.after_column,
+            window_start,
+            window_end,
+        });
+    }
 
-    Ok((exons, junctions, whole.score, whole_gene_n_edits, protein))
+    Ok((exons, junctions, whole.score, whole_gene_n_edits, protein, frameshifts))
 }
 
 #[cfg(test)]
@@ -668,5 +736,49 @@ mod tests {
 
         assert_eq!(outcome.n_filled, 3);
         assert_eq!(outcome.protein, "MVK", "must pick the whole-gene-coherent permutation, not the naive per-slot-greedy one (which would give MKV)");
+    }
+
+    #[test]
+    fn frameshift_in_an_exon_is_reported_on_its_slot() {
+        // exon1 = (MKVWF)x3; group II intron; exon2 = (MKVWF)x6 + stop with
+        // one extra A after its 15th codon
+        let half = "ATGAAAGTTTGGTTT".repeat(3);
+        let mut seq = b"CCC".to_vec();
+        seq.extend(half.as_bytes()); // exon1: 3..48
+        seq.extend(b"GTGCGTTTTTTTTTTTTTTTTTTTTAT"); // intron: 48..75
+        seq.extend(half.as_bytes()); // exon2: 75..
+        seq.push(b'A'); // 120
+        seq.extend(half.as_bytes());
+        seq.extend(b"TAACCC");
+        let mut sequences = HashMap::new();
+        sequences.insert("ctg1".to_string(), seq);
+        let fasta_idx = FastaIndex { sequences };
+        let cols = |n: usize| -> Vec<&'static [(u8, f64)]> {
+            let one: [&'static [(u8, f64)]; 5] =
+                [&[(b'M', 5.0)], &[(b'K', 5.0)], &[(b'V', 5.0)], &[(b'W', 5.0)], &[(b'F', 5.0)]];
+            (0..n).map(|i| one[i % 5]).collect()
+        };
+        let template = GeneTemplate {
+            gene: "test".to_string(),
+            slots: vec![
+                SlotTemplate { profile: custom_profile("e1", &cols(15)), min_self_score: -100.0, lead: 0, trail: 0 },
+                SlotTemplate { profile: custom_profile("e2", &cols(30)), min_self_score: -100.0, lead: 0, trail: 0 },
+            ],
+            whole_gene_profile: custom_profile("whole", &cols(45)),
+        };
+        let fragments = vec![
+            RawFragment { contig: "ctg1".to_string(), start: 3, end: 48, strand: '+' },
+            RawFragment { contig: "ctg1".to_string(), start: 75, end: 169, strand: '+' },
+        ];
+        let params = ScanParams { frameshift_penalty: 10.0, ..ScanParams::default() };
+        let outcome = reconstruct_gene(&fasta_idx, &fragments, &template, &params, 0, 1000, 0).unwrap();
+        assert_eq!(outcome.protein, "MKVWF".repeat(9));
+        assert_eq!(outcome.frameshifts.len(), 1);
+        let f = &outcome.frameshifts[0];
+        assert_eq!((f.slot, f.start, f.end, f.n_bases), (2, 120, 121, 1));
+
+        // single-frame: no frameshift, and exon 2 is cut short
+        let outcome = reconstruct_gene(&fasta_idx, &fragments, &template, &ScanParams::default(), 0, 1000, 0).unwrap();
+        assert!(outcome.frameshifts.is_empty());
     }
 }

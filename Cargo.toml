@@ -1,6 +1,6 @@
 [package]
 name = "transsplice"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 
 description = """
@@ -28,4 +28,4 @@ rayon = "1.12.0"
 #   orfedit = { path = "../orfedit" }
 # to an uncommitted .cargo/config.toml. Bump the pinned version here
 # whenever orfedit is republished.
-orfedit = "0.1.0"
+orfedit = "0.2.0"
