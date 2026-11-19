@@ -82,6 +82,11 @@ pub fn best_assignment(scores: &[Vec<f64>], floors: &[f64]) -> Assignment {
 /// is "leave unfilled"), trivial for the gene sizes this project handles
 /// (k <= 5).
 pub fn best_assignments_beam(scores: &[Vec<f64>], floors: &[f64], beam_width: usize) -> Vec<Assignment> {
+    best_assignments_beam_widths(scores, floors, &vec![beam_width; floors.len()])
+}
+
+/// `best_assignments_beam` with a beam width per slot.
+pub fn best_assignments_beam_widths(scores: &[Vec<f64>], floors: &[f64], beam_widths: &[usize]) -> Vec<Assignment> {
     let k = floors.len();
     let m = scores.len();
 
@@ -94,10 +99,18 @@ pub fn best_assignments_beam(scores: &[Vec<f64>], floors: &[f64], beam_width: us
             })
             .collect();
         cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        cands.truncate(beam_width);
+        cands.truncate(beam_widths[slot]);
         shortlists.push(cands);
     }
 
+    assignments_from_shortlists(&shortlists, m)
+}
+
+/// Every assignment that gives each slot one of its shortlisted
+/// (candidate, score) pairs or nothing, no candidate used twice; `m` is the
+/// number of candidates.
+pub fn assignments_from_shortlists(shortlists: &[Vec<(usize, f64)>], m: usize) -> Vec<Assignment> {
+    let k = shortlists.len();
     let mut results = Vec::new();
     let mut used = vec![false; m];
     let mut current: Vec<Option<usize>> = vec![None; k];
@@ -130,7 +143,7 @@ pub fn best_assignments_beam(scores: &[Vec<f64>], floors: &[f64], beam_width: us
         }
     }
 
-    recurse(0, k, &shortlists, &mut used, &mut current, 0.0, &mut results);
+    recurse(0, k, shortlists, &mut used, &mut current, 0.0, &mut results);
     results
 }
 
