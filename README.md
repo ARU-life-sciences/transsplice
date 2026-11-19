@@ -84,6 +84,18 @@ unaligned in the changed proteins falls from 50 to 1. Works for any
 organelle's templates: `poa` builds plastid ones (atpF, clpP, ndhA,
 ndhB, rpl2, rpoC1, rps12, rps16, ycf3) from 13 RefSeq plastomes.
 
+Speed and reproducibility (0.3.0). A batch runs in three stages, each
+a pool of parallel tasks: score and assign every gene's candidates, run
+every whole-contig search for an empty slot (largest first), then choose
+among assignments and refine junctions. Each (candidate, slot) scan and
+each distinct joined sequence is scored once per gene. With orfedit's
+faster alignment, the 8,993 DToL mito genes take 13 minutes and 0.7 GB
+at 16 threads (2 h 54 min and 9.8 GB before), with the same genes table
+and, exon by exon, the same scores and edits; 22 of 28,191 exons sit on
+a different, equal-scoring copy of a repeat. Candidates and output rows
+are now in a fixed order, so two runs give byte-identical tables (before,
+equal-scoring repeat copies won at random).
+
 **Known limitation - tiny exons.** A 7-19 codon exon (nad5 exon 3, 22 bp;
 nad1 exon 4, 59 bp) is too short for an upstream HMM search to hit and
 its profile too short to place it confidently de novo; its slot can end

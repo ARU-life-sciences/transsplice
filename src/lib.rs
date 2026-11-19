@@ -5,10 +5,45 @@ pub mod template;
 use anyhow::{Context, Result};
 use assign::{best_assignment, best_assignments_beam, classify_junction, Assignment};
 use candidate::{build_candidates, Candidate, RawFragment};
-use orfedit::align::{NtColumnCall, align_nt_frame0};
+use orfedit::align::{NtColumnCall, align_nt_frame0, align_nt_frame0_score};
 use orfedit::fasta::FastaIndex;
 use orfedit::{frameshifts_supported, scan_gene, ScanParams};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use template::GeneTemplate;
+
+/// What `evaluate_assignment` needs from one `scan_gene` call, kept so the
+/// same (candidate, slot) pair is scanned once per gene however many beam
+/// assignments use it.
+#[derive(Clone)]
+struct ScanSummary {
+    score: f64,
+    corrected_start: usize,
+    corrected_end: usize,
+    includes_stop: bool,
+    edits: Vec<(usize, usize, char)>, // genomic_pos, profile_column, resulting_aa
+}
+
+impl ScanSummary {
+    fn from_outcome(o: orfedit::ScanOutcome) -> Self {
+        ScanSummary {
+            score: o.score,
+            corrected_start: o.corrected_start,
+            corrected_end: o.corrected_end,
+            includes_stop: o.includes_stop,
+            edits: o.edits.iter().map(|e| (e.genomic_pos, e.profile_column, e.resulting_aa)).collect(),
+        }
+    }
+}
+
+/// Per-gene memo tables: scans by (candidate index, slot index), always
+/// with the exon-scan parameters; whole-gene alignment scores by the
+/// joined exon sequence, always with the gene's frameshift penalty.
+#[derive(Default)]
+struct GeneCache {
+    scans: RefCell<HashMap<(usize, usize), Option<ScanSummary>>>,
+    whole_scores: RefCell<HashMap<Vec<u8>, f64>>,
+}
 
 pub struct ExonResult {
     pub slot: usize, // 1-indexed exon number
@@ -154,27 +189,80 @@ pub fn reconstruct_gene(
     junction_distance_threshold: i64,
     exon_flank: i64,
 ) -> Result<ReconstructionOutcome> {
+    let (prepared, tasks) = prepare_gene(fasta_idx, fragments, template, params, merge_distance, exon_flank);
+    let scans: Vec<DenovoScan> = tasks.iter().map(|t| denovo_scan(fasta_idx, template, params, t)).collect();
+    finish_gene(fasta_idx, prepared, &tasks, &scans, template, params, junction_distance_threshold, exon_flank)
+}
+
+/// One whole-contig de novo scan a gene needs: an empty slot's profile
+/// against one strand of one contig.
+pub struct DenovoTask {
+    pub slot: usize, // 0-indexed
+    pub contig: String,
+    pub len: i64,
+    pub strand: char,
+}
+
+impl DenovoTask {
+    /// DP size (profile columns x bases): what the scan's cost scales with.
+    pub fn cells(&self, template: &GeneTemplate) -> u64 {
+        template.slots[self.slot].profile.len() as u64 * self.len as u64
+    }
+}
+
+/// A de novo scan's score and corrected [start, end), or None if it failed.
+pub type DenovoScan = Option<(f64, i64, i64)>;
+
+/// A gene after candidate scoring and first assignment, waiting for its
+/// de novo scans (`finish_gene`).
+pub struct Prepared {
+    candidates: Vec<Candidate>,
+    scores: Vec<Vec<f64>>,
+    assignment: Assignment,
+    cache: GeneCache,
+}
+
+/// Stage 1 of `reconstruct_gene`: build and score the candidates, assign
+/// them, and list the de novo scans the empty slots need (in slot, contig,
+/// strand order). The three stages are separate so a batch can run every
+/// gene's de novo scans - nearly all of the run time, and very uneven
+/// between genes - as one flat pool of parallel tasks.
+pub fn prepare_gene(
+    fasta_idx: &FastaIndex,
+    fragments: &[RawFragment],
+    template: &GeneTemplate,
+    params: &ScanParams,
+    merge_distance: i64,
+    exon_flank: i64,
+) -> (Prepared, Vec<DenovoTask>) {
     let k = template.slots.len();
-    let mut candidates = build_candidates(fragments, merge_distance);
+    let candidates = build_candidates(fragments, merge_distance);
 
     let exon_params = ScanParams { flank: exon_flank, ..*params };
-    let mut scores: Vec<Vec<f64>> = candidates
+    let cache = GeneCache::default();
+    let scores: Vec<Vec<f64>> = candidates
         .iter()
-        .map(|cand| {
+        .enumerate()
+        .map(|(ci, cand)| {
             template
                 .slots
                 .iter()
-                .map(|slot| {
-                    scan_gene(fasta_idx, &cand.contig, cand.start, cand.end, cand.strand, &slot.profile, &exon_params)
-                        .map(|o| o.score)
-                        .unwrap_or(f64::NEG_INFINITY)
+                .enumerate()
+                .map(|(si, slot)| {
+                    let summary =
+                        scan_gene(fasta_idx, &cand.contig, cand.start, cand.end, cand.strand, &slot.profile, &exon_params)
+                            .ok()
+                            .map(ScanSummary::from_outcome);
+                    let score = summary.as_ref().map_or(f64::NEG_INFINITY, |o| o.score);
+                    cache.scans.borrow_mut().insert((ci, si), summary);
+                    score
                 })
                 .collect()
         })
         .collect();
 
     let floors: Vec<f64> = template.slots.iter().map(|s| s.min_self_score).collect();
-    let mut assignment = best_assignment(&scores, &floors);
+    let assignment = best_assignment(&scores, &floors);
 
     // De novo fallback: any slot no candidate could fill gets a whole-contig
     // scan (flank=0 => the whole requested region is the search window),
@@ -183,21 +271,57 @@ pub fn reconstruct_gene(
     let mut contigs: Vec<String> = fragments.iter().map(|f| f.contig.clone()).collect();
     contigs.sort();
     contigs.dedup();
-    let denovo_params = ScanParams { flank: 0, ..*params };
-    let mut denovo_candidate_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-    for (si, slot) in template.slots.iter().enumerate() {
-        if assignment.slot_to_candidate[si].is_some() {
-            continue;
-        }
-        let mut best: Option<(f64, i64, i64, String, char)> = None;
+    let mut tasks: Vec<DenovoTask> = Vec::new();
+    for si in (0..k).filter(|&si| assignment.slot_to_candidate[si].is_none()) {
         for contig in &contigs {
             let Some(len) = fasta_idx.sequences.get(contig).map(|s| s.len() as i64) else { continue };
             for strand in ['+', '-'] {
-                if let Ok(o) = scan_gene(fasta_idx, contig, 0, len, strand, &slot.profile, &denovo_params) {
-                    if o.score >= slot.min_self_score && best.as_ref().is_none_or(|b| o.score > b.0) {
-                        best = Some((o.score, o.corrected_start as i64, o.corrected_end as i64, contig.clone(), strand));
-                    }
+                tasks.push(DenovoTask { slot: si, contig: contig.clone(), len, strand });
+            }
+        }
+    }
+    (Prepared { candidates, scores, assignment, cache }, tasks)
+}
+
+/// Stage 2: one de novo scan.
+pub fn denovo_scan(fasta_idx: &FastaIndex, template: &GeneTemplate, params: &ScanParams, task: &DenovoTask) -> DenovoScan {
+    let denovo_params = ScanParams { flank: 0, ..*params };
+    scan_gene(fasta_idx, &task.contig, 0, task.len, task.strand, &template.slots[task.slot].profile, &denovo_params)
+        .ok()
+        .map(|o| (o.score, o.corrected_start as i64, o.corrected_end as i64))
+}
+
+/// Stage 3: take the de novo scans (`scans[i]` for `tasks[i]`, as
+/// `prepare_gene` listed them, so ties resolve as in a serial loop), then
+/// choose among assignments by whole-gene alignment and refine junctions.
+#[allow(clippy::too_many_arguments)]
+pub fn finish_gene(
+    fasta_idx: &FastaIndex,
+    prepared: Prepared,
+    tasks: &[DenovoTask],
+    scans: &[DenovoScan],
+    template: &GeneTemplate,
+    params: &ScanParams,
+    junction_distance_threshold: i64,
+    exon_flank: i64,
+) -> Result<ReconstructionOutcome> {
+    let k = template.slots.len();
+    let Prepared { mut candidates, mut scores, mut assignment, cache } = prepared;
+    let exon_params = ScanParams { flank: exon_flank, ..*params };
+    let floors: Vec<f64> = template.slots.iter().map(|s| s.min_self_score).collect();
+    let mut denovo_candidate_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    let empty_slots: Vec<usize> = (0..k).filter(|&si| assignment.slot_to_candidate[si].is_none()).collect();
+    for &si in &empty_slots {
+        let slot = &template.slots[si];
+        let mut best: Option<(f64, i64, i64, String, char)> = None;
+        for (task, scan) in tasks.iter().zip(scans) {
+            if task.slot != si {
+                continue;
+            }
+            if let Some((score, start, end)) = *scan {
+                if score >= slot.min_self_score && best.as_ref().is_none_or(|b| score > b.0) {
+                    best = Some((score, start, end, task.contig.clone(), task.strand));
                 }
             }
         }
@@ -230,7 +354,7 @@ pub fn reconstruct_gene(
     for (bi, candidate_assignment) in beam.iter().enumerate() {
         let Ok(result) = evaluate_assignment(
             fasta_idx, &candidates, template, candidate_assignment, &exon_params, params,
-            &denovo_candidate_indices, junction_distance_threshold, false,
+            &denovo_candidate_indices, junction_distance_threshold, false, &cache,
         ) else {
             continue;
         };
@@ -241,7 +365,7 @@ pub fn reconstruct_gene(
     let (bi, unrefined) = best.context("no candidate assignment (not even the empty one) produced a result")?;
     let (exons, junctions, whole_gene_score, whole_gene_n_edits, protein, frameshifts) = evaluate_assignment(
         fasta_idx, &candidates, template, &beam[bi], &exon_params, params,
-        &denovo_candidate_indices, junction_distance_threshold, true,
+        &denovo_candidate_indices, junction_distance_threshold, true, &cache,
     )
     .unwrap_or(unrefined);
 
@@ -274,15 +398,34 @@ fn evaluate_assignment(
     denovo_candidate_indices: &std::collections::HashSet<usize>,
     junction_distance_threshold: i64,
     refine_junctions: bool,
+    cache: &GeneCache,
 ) -> Result<Evaluated> {
     let k = template.slots.len();
     let mut placed: Vec<Placed> = Vec::new();
     for (si, slot) in template.slots.iter().enumerate() {
         let Some(ci) = assignment.slot_to_candidate[si] else { continue };
         let cand = &candidates[ci];
-        let outcome = scan_gene(fasta_idx, &cand.contig, cand.start, cand.end, cand.strand, &slot.profile, exon_params)?;
+        // Same contig/coordinates/strand/profile/parameters => same result,
+        // so reuse the scan done for the score matrix (or for an earlier
+        // beam assignment, for de novo candidates added after it).
+        let cached = cache.scans.borrow().get(&(ci, si)).cloned();
+        let outcome = match cached {
+            Some(o) => o,
+            None => {
+                let o = scan_gene(fasta_idx, &cand.contig, cand.start, cand.end, cand.strand, &slot.profile, exon_params)
+                    .ok()
+                    .map(ScanSummary::from_outcome);
+                cache.scans.borrow_mut().insert((ci, si), o.clone());
+                o
+            }
+        }
+        .context("exon scan failed")?;
         let (mut core_start, mut core_end) = (outcome.corrected_start as i64, outcome.corrected_end as i64);
-        let mut edits = outcome.edits;
+        let mut edits: Vec<orfedit::EditCall> = outcome
+            .edits
+            .iter()
+            .map(|&(genomic_pos, profile_column, resulting_aa)| orfedit::EditCall { genomic_pos, profile_column, resulting_aa })
+            .collect();
         // scan_gene folds in a following stop codon (possibly edit-created).
         // Only the gene's last exon ends in one; after any other exon that
         // "codon" is split-codon/intron sequence, and CGA/CAA/CAG read as
@@ -351,15 +494,23 @@ fn evaluate_assignment(
         concat
     };
     let score_of = |ext5: &[i64], ext3: &[i64]| -> f64 {
-        align_nt_frame0(
+        // Coordinate descent revisits placements (the chosen split is
+        // re-scored as the zero shift, and so on): score each distinct
+        // joined sequence once.
+        let concat = concat_of(ext5, ext3);
+        if let Some(&s) = cache.whole_scores.borrow().get(&concat) {
+            return s;
+        }
+        let s = align_nt_frame0_score(
             &template.whole_gene_profile,
-            &concat_of(ext5, ext3),
+            &concat,
             params.gap_open,
             params.gap_extend,
             params.edit_penalty,
             params.frameshift_penalty,
-        )
-        .score
+        );
+        cache.whole_scores.borrow_mut().insert(concat, s);
+        s
     };
     let junction_bonus = |i: usize, ext5: &[i64], ext3: &[i64]| -> f64 {
         let (a, b) = (&placed[i], &placed[i + 1]);
@@ -450,6 +601,7 @@ fn evaluate_assignment(
         align_nt_frame0(&template.whole_gene_profile, &concat, params.gap_open, params.gap_extend, params.edit_penalty, penalty)
     };
     let mut whole = align_whole(params.frameshift_penalty);
+    cache.whole_scores.borrow_mut().entry(concat.clone()).or_insert(whole.score);
     if !whole.frameshifts.is_empty() && !frameshifts_supported(&template.whole_gene_profile, &whole, params) {
         whole = align_whole(f64::INFINITY);
     }

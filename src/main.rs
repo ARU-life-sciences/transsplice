@@ -13,7 +13,7 @@ use std::fs;
 use std::path::PathBuf;
 use transsplice::candidate::RawFragment;
 use transsplice::template::GeneTemplate;
-use transsplice::reconstruct_gene;
+use transsplice::{denovo_scan, finish_gene, prepare_gene, DenovoScan, DenovoTask, Prepared};
 
 #[derive(Parser)]
 #[command(name = "transsplice", version, about)]
@@ -108,7 +108,7 @@ fn parse_manifest(path: &PathBuf) -> Result<Vec<ManifestRow>> {
     Ok(rows)
 }
 
-#[derive(Clone, Hash, Eq, PartialEq)]
+#[derive(Clone, Hash, Eq, PartialEq, PartialOrd, Ord)]
 struct GroupKey {
     species: String,
     organelle: String,
@@ -235,20 +235,72 @@ fn main() -> Result<()> {
             }
 
             let params = ScanParams { gap_open, gap_extend, edit_penalty, flank: 0, frameshift_penalty, ..ScanParams::default() };
-            let group_vec: Vec<(&GroupKey, &Vec<&ManifestRow>)> = groups.iter().collect();
+            let mut group_vec: Vec<(&GroupKey, &Vec<&ManifestRow>)> = groups.iter().collect();
+            group_vec.sort_by(|a, b| a.0.cmp(b.0)); // stable output row order
 
-            let results: Vec<(GeneRow, Vec<ExonRow>, Vec<JunctionRow>, Vec<EditRow>, Vec<String>)> = group_vec
+            // Three stages, each a flat pool of parallel tasks (see
+            // transsplice::prepare_gene): score and assign every gene's
+            // candidates; run every de novo scan, largest first; finish
+            // every gene. One task per item throughout: costs differ by
+            // orders of magnitude, and a multi-item chunk can't be stolen
+            // once a thread has started it.
+            let prepared: Vec<Option<(Prepared, Vec<DenovoTask>)>> = group_vec
                 .par_iter()
-                .filter_map(|(key, frags)| {
+                .with_max_len(1)
+                .map(|(key, frags)| {
                     let template = templates.get(&key.template_dir)?;
                     let fasta_idx = fastas.get(&key.fasta)?;
                     let fragments: Vec<RawFragment> = frags
                         .iter()
                         .map(|f| RawFragment { contig: f.contig.clone(), start: f.start, end: f.end, strand: f.strand })
                         .collect();
-                    match reconstruct_gene(
-                        fasta_idx, &fragments, template, &params,
-                        merge_distance, junction_distance_threshold, exon_flank,
+                    Some(prepare_gene(fasta_idx, &fragments, template, &params, merge_distance, exon_flank))
+                })
+                .collect();
+            let (prepared, tasks): (Vec<Option<Prepared>>, Vec<Vec<DenovoTask>>) = prepared
+                .into_iter()
+                .map(|p| match p {
+                    Some((prepared, tasks)) => (Some(prepared), tasks),
+                    None => (None, Vec::new()),
+                })
+                .unzip();
+            let mut jobs: Vec<(u64, usize, usize)> = Vec::new(); // (cells, gene, task)
+            for (gi, gene_tasks) in tasks.iter().enumerate() {
+                let template = &templates[&group_vec[gi].0.template_dir];
+                for (ti, t) in gene_tasks.iter().enumerate() {
+                    jobs.push((t.cells(template), gi, ti));
+                }
+            }
+            jobs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+            let scanned: Vec<(usize, usize, DenovoScan)> = jobs
+                .par_iter()
+                .with_max_len(1)
+                .map(|&(_, gi, ti)| {
+                    let key = group_vec[gi].0;
+                    (gi, ti, denovo_scan(&fastas[&key.fasta], &templates[&key.template_dir], &params, &tasks[gi][ti]))
+                })
+                .collect();
+            let mut scans: Vec<Vec<DenovoScan>> = tasks.iter().map(|t| vec![None; t.len()]).collect();
+            for (gi, ti, scan) in scanned {
+                scans[gi][ti] = scan;
+            }
+            let work: Vec<(&GroupKey, Prepared, Vec<DenovoTask>, Vec<DenovoScan>)> = group_vec
+                .iter()
+                .zip(prepared)
+                .zip(tasks)
+                .zip(scans)
+                .filter_map(|((((key, _), prepared), tasks), scans)| Some((*key, prepared?, tasks, scans)))
+                .collect();
+
+            let results: Vec<(GeneRow, Vec<ExonRow>, Vec<JunctionRow>, Vec<EditRow>, Vec<String>)> = work
+                .into_par_iter()
+                .with_max_len(1)
+                .filter_map(|(key, prepared, tasks, scans)| {
+                    let template = templates.get(&key.template_dir)?;
+                    let fasta_idx = fastas.get(&key.fasta)?;
+                    match finish_gene(
+                        fasta_idx, prepared, &tasks, &scans, template, &params,
+                        junction_distance_threshold, exon_flank,
                     ) {
                         Ok(outcome) => {
                             let gene_row = GeneRow {

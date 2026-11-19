@@ -47,6 +47,10 @@ pub fn build_candidates(fragments: &[RawFragment], merge_distance: i64) -> Vec<C
         groups.entry((f.contig.clone(), f.strand)).or_default().push(f);
     }
 
+    // HashMap order is random per process: fix the order of merged-run
+    // candidates so equal-scoring ties resolve the same way every run.
+    let mut groups: Vec<((String, char), Vec<&RawFragment>)> = groups.into_iter().collect();
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
     for ((contig, strand), mut frags) in groups {
         frags.sort_by_key(|f| f.start);
         let mut i = 0;
