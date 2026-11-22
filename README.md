@@ -165,6 +165,20 @@ spliced mito genes from 30 DToL fern assemblies, `--stop-edit-penalty
 plastid ones from 74 to 117 of 233. With both off the output is
 unchanged. The edits table has an `edit` column, `C>U` or `U>C`.
 
+Junction slide. `--junction-slide N` (0, off, by default) lets junction
+refinement move each exon junction up to N bases along - bases off one
+exon and onto its neighbour, the joined length unchanged - where the
+whole-gene alignment gains by more than 1. The refinement before it tries
+each split of the shared codon and a codon either side one at a time, and
+cannot reach a slide, which changes all three at once. It is judged on
+the protein alone: with the intron-end bonus it moved 13 junctions that
+RNA reads confirm onto a chance motif nearby. Checked against
+intron-spanning RNA-seq reads in 11 DToL ferns: at 6, 135 of 144
+junctions give the transcript the reads show against 126 (nad5's 22 bp
+exon 3 was a base or two off in all ten). It is off by default because
+held out on 24 angiosperm RefSeq genomes it places 425 of 477 exons right
+against 427. With it off the output is unchanged.
+
 Still wrong: a gene whose exon count differs from the template's (cox2
 with one intron or two; an intron lost so two template exons are one
 stretch of genome, which one candidate can't fill twice - nad7 in

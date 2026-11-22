@@ -65,6 +65,11 @@ enum Command {
         junction_distance_threshold: i64,
         #[arg(long, default_value_t = 60)]
         exon_flank: i64,
+        /// Let junction refinement slide each exon junction up to this many
+        /// bases either way where the whole-gene alignment clearly gains;
+        /// 0, the default, for none
+        #[arg(long, default_value_t = 0)]
+        junction_slide: i64,
         /// Cost of a frame change (skipping 1 or 2 bases) inside a gene;
         /// "inf" keeps every exon and the joined CDS in one reading frame
         #[arg(long, default_value_t = 20.0)]
@@ -193,9 +198,11 @@ fn main() -> Result<()> {
             merge_distance,
             junction_distance_threshold,
             exon_flank,
+            junction_slide,
             frameshifts_out,
             frameshift_penalty,
         } => {
+            transsplice::set_junction_slide(junction_slide);
             rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().ok();
 
             let rows = parse_manifest(&manifest)?;

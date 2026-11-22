@@ -71,6 +71,19 @@ pub struct ExonResult {
 /// one by more than a tiebreak; 20.0 got 21/32 and 40/100 changed nothing,
 /// with protein identity identical throughout (a chance motif within the
 /// few-bp refinement window is rare).
+/// How far (bases) junction refinement slides a junction either way; 0,
+/// the default, for no slide. A setting of the whole run (`--junction-slide`).
+/// Off by default because it is not a clear gain everywhere: at 6, 135 of
+/// 144 junctions in 11 ferns agree with intron-spanning RNA reads against
+/// 126, but held out on 24 angiosperm RefSeq genomes 425 of 477 exons are
+/// placed right against 427 (two plastid exons moved off).
+static JUNCTION_SLIDE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn set_junction_slide(bases: i64) {
+    JUNCTION_SLIDE.store(bases.max(0), std::sync::atomic::Ordering::Relaxed);
+}
+/// Whole-gene score a slid junction must gain to be taken.
+const JUNCTION_SLIDE_MARGIN: f64 = 1.0;
 pub const SPLICE_MOTIF_BONUS: f64 = 20.0;
 
 /// An exon slot whose profile has at most this many columns (90 bp) is
@@ -789,8 +802,7 @@ fn evaluate_assignment(
         }
         let floor_a = (-(placed[i].core_end - placed[i].core_start) + 3).max(-3); // keep >= one codon
         let floor_b = (-(placed[i + 1].core_end - placed[i + 1].core_start) + 3).max(-3);
-        let eval = |t: i64, da: i64, db: i64| -> Option<f64> {
-            let (e3, e5) = (t + 3 * da, (3 - t).rem_euclid(3) + 3 * db);
+        let eval_ext = |e3: i64, e5: i64| -> Option<f64> {
             if e3 < floor_a || e5 < floor_b {
                 return None;
             }
@@ -799,6 +811,7 @@ fn evaluate_assignment(
             t5[i + 1] = e5;
             Some(score_of(&t5, &t3) + junction_bonus(i, &t5, &t3))
         };
+        let eval = |t: i64, da: i64, db: i64| -> Option<f64> { eval_ext(t + 3 * da, (3 - t).rem_euclid(3) + 3 * db) };
         let argmax = |opts: Vec<(i64, Option<f64>)>, default: i64| -> i64 {
             opts.into_iter()
                 .filter_map(|(v, s)| s.map(|s| (v, s)))
@@ -809,9 +822,41 @@ fn evaluate_assignment(
         let t = argmax((0..3).map(|t| (t, eval(t, 0, 0))).collect(), t0);
         let da = argmax((-JUNCTION_CODON_SHIFT..=JUNCTION_CODON_SHIFT).map(|d| (d, eval(t, d, 0))).collect(), 0);
         let db = argmax((-JUNCTION_CODON_SHIFT..=JUNCTION_CODON_SHIFT).map(|d| (d, eval(t, da, d))).collect(), 0);
-        if eval(t, da, db).is_some() {
-            ext3[i] = t + 3 * da;
-            ext5[i + 1] = (3 - t).rem_euclid(3) + 3 * db;
+        if let Some(found) = eval(t, da, db) {
+            let (e3, e5) = (t + 3 * da, (3 - t).rem_euclid(3) + 3 * db);
+            // Then slide the junction along: k bases off one exon and onto
+            // the other, the joined length (and the frame) unchanged. The
+            // descent above cannot get there - a base moved across is a
+            // change of split and of both exons' lengths at once, and each
+            // of those alone breaks the frame. Seen against intron-spanning
+            // RNA reads in 11 ferns: nad5's exons 3-4 (a 22 bp exon) sat 1-2
+            // bases along from where the reads put them in all ten.
+            // Judged on the protein alone, and only for a clear gain: the
+            // intron-end bonus, sized to settle a split codon, moved 13
+            // junctions the reads confirm onto a chance motif nearby. (A
+            // gain of 1 to 4 gives the same result; at 8 nothing moves.)
+            let _ = found;
+            let protein_of = |e3: i64, e5: i64| -> Option<f64> {
+                if e3 < floor_a || e5 < floor_b {
+                    return None;
+                }
+                let (mut t5, mut t3) = (ext5.clone(), ext3.clone());
+                t3[i] = e3;
+                t5[i + 1] = e5;
+                Some(score_of(&t5, &t3))
+            };
+            let base = protein_of(e3, e5).unwrap_or(f64::NEG_INFINITY);
+            let reach = JUNCTION_SLIDE.load(std::sync::atomic::Ordering::Relaxed);
+            let (mut best, mut slide) = (base + JUNCTION_SLIDE_MARGIN, 0);
+            for k in (-reach..=reach).filter(|&k| k != 0) {
+                if let Some(s) = protein_of(e3 + k, e5 - k) {
+                    if s > best {
+                        (best, slide) = (s, k);
+                    }
+                }
+            }
+            ext3[i] = e3 + slide;
+            ext5[i + 1] = e5 - slide;
         }
     }
 
