@@ -156,6 +156,8 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "orfedit"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89f78a63de78b9784599748eb5de5f8f7b6c37fab02c14bc71bd60ef2796699e"
 dependencies = [
  "anyhow",
  "clap",
