@@ -165,6 +165,19 @@ spliced mito genes from 30 DToL fern assemblies, `--stop-edit-penalty
 plastid ones from 74 to 117 of 233. With both off the output is
 unchanged. The edits table has an `edit` column, `C>U` or `U>C`.
 
+Editing sites. `--known-edit-penalty` and `--novel-edit-penalty` are
+orfedit's too: for templates whose profiles say where their reference
+proteins are edited (a 21st `edit` column; see orfedit's README), the
+cost of a C-to-U edit at a column edited in them and at any other, each
+`--edit-penalty` unless given. They apply to the exon scans, where a
+gene's edits are called, and to the whole-gene alignment. On 107 DToL
+angiosperms with RNA-seq, held out by genus, 1.5 at the known columns
+and 10 away from them takes the edits called in spliced plastid genes
+from 59% to 94% in the RNA, and those in spliced mitochondrial genes
+from 96% to 98%, with more of them right in both (822 against 721, 7,140
+against 6,963).
+Templates without the column are read as before.
+
 Junction slide. `--junction-slide N` (0, off, by default) lets junction
 refinement move each exon junction up to N bases along - bases off one
 exon and onto its neighbour, the joined length unchanged - where the

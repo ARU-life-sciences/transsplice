@@ -59,6 +59,14 @@ enum Command {
         /// U-to-C edit; "inf", the default, for none (see orfedit)
         #[arg(long, default_value_t = f64::INFINITY)]
         stop_edit_penalty: f64,
+        /// For profiles that say where their reference proteins are edited
+        /// (see orfedit): the cost of a C-to-U edit at a column edited in
+        /// them. Default: --edit-penalty
+        #[arg(long)]
+        known_edit_penalty: Option<f64>,
+        /// ...and at a column that is not. Default: --edit-penalty
+        #[arg(long)]
+        novel_edit_penalty: Option<f64>,
         #[arg(long, default_value_t = 5000)]
         merge_distance: i64,
         #[arg(long, default_value_t = 10000)]
@@ -195,6 +203,8 @@ fn main() -> Result<()> {
             edit_penalty,
             reverse_edit_penalty,
             stop_edit_penalty,
+            known_edit_penalty,
+            novel_edit_penalty,
             merge_distance,
             junction_distance_threshold,
             exon_flank,
@@ -253,7 +263,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            let params = ScanParams { gap_open, gap_extend, edit_penalty, reverse_edit_penalty, stop_edit_penalty, flank: 0, frameshift_penalty, ..ScanParams::default() };
+            let params = ScanParams { gap_open, gap_extend, edit_penalty, reverse_edit_penalty, stop_edit_penalty, known_edit_penalty, novel_edit_penalty, flank: 0, frameshift_penalty, ..ScanParams::default() };
             let mut group_vec: Vec<(&GroupKey, &Vec<&ManifestRow>)> = groups.iter().collect();
             group_vec.sort_by(|a, b| a.0.cmp(b.0)); // stable output row order
 

@@ -1145,7 +1145,7 @@ mod tests {
                 col
             })
             .collect();
-        Profile { gene: gene.to_string(), columns }
+        Profile { gene: gene.to_string(), columns, edited: None }
     }
 
     #[test]
@@ -1421,7 +1421,7 @@ mod tests {
                 col
             })
             .collect();
-        Profile { gene: gene.to_string(), columns: cols }
+        Profile { gene: gene.to_string(), columns: cols, edited: None }
     }
 
     #[test]
