@@ -421,10 +421,13 @@ pub fn finish_gene(
     }
 
     let empty_slots: Vec<usize> = (0..k).filter(|&si| assignment.slot_to_candidate[si].is_none()).collect();
+    // the whole-contig hit taken for each slot the fragments left empty
+    let mut found_for_slot: Vec<Option<usize>> = vec![None; k];
     for &si in &empty_slots {
         if let Some(&(score, start, end, task)) = hits_for(si).first() {
             let new = Candidate { contig: task.contig.clone(), start, end, strand: task.strand, provenance: "denovo".to_string() };
             let idx = add_candidate(&mut candidates, &mut scores, &mut denovo_candidate_indices, new, si, score, k);
+            found_for_slot[si] = Some(idx);
             assignment.slot_to_candidate[si] = Some(idx);
             assignment.total_score += score;
         }
@@ -461,7 +464,19 @@ pub fn finish_gene(
                 (0..candidates.len()).map(|ci| (ci, scores[ci][si])).filter(|c| c.1 >= floors[si]).collect();
             ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             if !short_slots.contains(&si) {
+                // The whole-contig hit of a slot the fragments left empty
+                // stays in. Where a species has lost introns, one fragment
+                // holds several exons end to end; it and the merged run
+                // score every one of those slots as well as the hit does,
+                // and at two candidates a slot they would crowd it out -
+                // yet each can fill one slot only (liverwort cox1 without
+                // four of its nine introns: exons 6 to 9 are one genomic
+                // exon, and 6 and 7 stayed empty).
+                let found = found_for_slot[si].filter(|&d| ranked.iter().skip(2).any(|c| c.0 == d));
                 ranked.truncate(2);
+                if let Some(d) = found {
+                    ranked.push((d, scores[d][si]));
+                }
                 return ranked;
             }
             let mut places: Vec<Option<(&str, char, usize, usize)>> = Vec::new();
