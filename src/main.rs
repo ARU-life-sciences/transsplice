@@ -67,6 +67,18 @@ enum Command {
         /// ...and at a column that is not. Default: --edit-penalty
         #[arg(long)]
         novel_edit_penalty: Option<f64>,
+        /// Cost of a stop codon inside a gene whose protein goes on
+        /// matching beyond it: aligned to a profile column, `*` in the
+        /// protein, counted in n_internal_stops (see orfedit). "inf", the
+        /// default: an alignment cannot pass a stop, and gets round one in
+        /// a gene by two frame changes
+        #[arg(long, default_value_t = f64::INFINITY)]
+        internal_stop_penalty: f64,
+        /// A gene whose only frame changes lie within this many profile
+        /// columns of its start or end is read in one frame instead (see
+        /// orfedit; 0: frame changes kept wherever they are)
+        #[arg(long, default_value_t = 0)]
+        end_margin: usize,
         #[arg(long, default_value_t = 5000)]
         merge_distance: i64,
         #[arg(long, default_value_t = 10000)]
@@ -205,6 +217,8 @@ fn main() -> Result<()> {
             stop_edit_penalty,
             known_edit_penalty,
             novel_edit_penalty,
+            internal_stop_penalty,
+            end_margin,
             merge_distance,
             junction_distance_threshold,
             exon_flank,
@@ -263,7 +277,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            let params = ScanParams { gap_open, gap_extend, edit_penalty, reverse_edit_penalty, stop_edit_penalty, known_edit_penalty, novel_edit_penalty, flank: 0, frameshift_penalty, ..ScanParams::default() };
+            let params = ScanParams { gap_open, gap_extend, edit_penalty, reverse_edit_penalty, stop_edit_penalty, known_edit_penalty, novel_edit_penalty, internal_stop_penalty, end_margin, flank: 0, frameshift_penalty, ..ScanParams::default() };
             let mut group_vec: Vec<(&GroupKey, &Vec<&ManifestRow>)> = groups.iter().collect();
             group_vec.sort_by(|a, b| a.0.cmp(b.0)); // stable output row order
 
@@ -408,12 +422,12 @@ fn write_outputs(
         }
     }
 
-    let mut g = String::from("species\torganelle\tgene\tn_slots\tn_filled\tcomplete\twhole_gene_score\twhole_gene_n_edits\tprotein\n");
+    let mut g = String::from("species\torganelle\tgene\tn_slots\tn_filled\tcomplete\twhole_gene_score\twhole_gene_n_edits\tprotein\tn_internal_stops\n");
     for (row, ..) in results {
         g.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\n",
             row.species, row.organelle, row.gene, row.n_slots, row.n_filled, row.complete,
-            row.whole_gene_score, row.whole_gene_n_edits, row.protein
+            row.whole_gene_score, row.whole_gene_n_edits, row.protein, row.protein.bytes().filter(|&b| b == b'*').count()
         ));
     }
     let tmp = genes_out.with_extension("tsv.tmp");

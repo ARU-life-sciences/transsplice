@@ -112,8 +112,10 @@ const SHORT_SLOT_PLACES: usize = 3;
 /// profile columns that sits on a column where the references have Met...
 const START_SEARCH_COLUMNS: usize = 15;
 /// ...and the last exon ends at the first in-frame stop codon: one inside
-/// it (provided at least half the profile is aligned before it), else one
-/// within this many codons of its last aligned codon.
+/// it - read through at a price (`--internal-stop-penalty`), or, where
+/// U-to-C editing lets an alignment step over a stop, skipped - provided
+/// at least half the profile is aligned before it, else one within this
+/// many codons of its last aligned codon.
 const STOP_SEARCH_CODONS: usize = 15;
 
 /// How far (in codons) each side of a junction may move from the
@@ -299,7 +301,7 @@ pub fn prepare_gene(
     let k = template.slots.len();
     let candidates = build_candidates(fragments, merge_distance);
 
-    let exon_params = ScanParams { flank: exon_flank, ..*params };
+    let exon_params = ScanParams { flank: exon_flank, end_margin: 0, ..*params }; // (the margin is the whole gene's)
     let cache = GeneCache::default();
     let scores: Vec<Vec<f64>> = candidates
         .iter()
@@ -351,7 +353,7 @@ fn is_short(slot: &template::SlotTemplate) -> bool {
 
 /// Stage 2: one de novo scan.
 pub fn denovo_scan(fasta_idx: &FastaIndex, template: &GeneTemplate, params: &ScanParams, task: &DenovoTask) -> DenovoScan {
-    let denovo_params = ScanParams { flank: 0, ..*params };
+    let denovo_params = ScanParams { flank: 0, end_margin: 0, ..*params };
     scan_gene(fasta_idx, &task.contig, 0, task.len, task.strand, &template.slots[task.slot].profile, &denovo_params)
         .ok()
         .map(|o| (o.score, o.corrected_start as i64, o.corrected_end as i64))
@@ -373,7 +375,7 @@ pub fn finish_gene(
 ) -> Result<ReconstructionOutcome> {
     let k = template.slots.len();
     let Prepared { mut candidates, mut scores, mut assignment, cache } = prepared;
-    let exon_params = ScanParams { flank: exon_flank, ..*params };
+    let exon_params = ScanParams { flank: exon_flank, end_margin: 0, ..*params }; // (the margin is the whole gene's)
     let floors: Vec<f64> = template.slots.iter().map(|s| s.min_self_score).collect();
     let mut denovo_candidate_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
@@ -523,7 +525,7 @@ pub fn finish_gene(
     // alignment plus intron motifs scores higher with it. A short profile's
     // own score can't tell the exon from a chance match; the protein it
     // completes and the intron ends beside it can.
-    let denovo_params = ScanParams { flank: 0, ..*params };
+    let denovo_params = ScanParams { flank: 0, end_margin: 0, ..*params };
     for &si in &short_slots {
         let mut alternatives: Vec<usize> = Vec::new();
         for (score, start, end, task) in hits_for(si).into_iter().take(DENOVO_ALTERNATIVES) {
@@ -918,6 +920,15 @@ fn evaluate_assignment(
         if !whole.frameshifts.is_empty() && !frameshifts_supported(&template.whole_gene_profile, &whole, params) {
             whole = align_whole(f64::INFINITY);
         }
+        // Frame changes within `end_margin` profile columns of the gene's
+        // start or end buy only its first or last few columns, and cannot
+        // be told from a gene that starts or ends differently there (see
+        // orfedit): if those are all it has, the gene is read in one frame.
+        let n = template.whole_gene_profile.len();
+        let margin = params.end_margin.min(n / 4);
+        if !whole.frameshifts.is_empty() && whole.frameshifts.iter().all(|f| f.after_column < margin || f.after_column + margin > n) {
+            whole = align_whole(f64::INFINITY);
+        }
         Ok((concat, offsets, whole))
     };
     let (concat, mut offsets, mut whole) = align_exons(&exons)?;
@@ -1095,6 +1106,14 @@ fn terminal_adjustment(
         // column was worth): it says nothing about where the gene ends.
         if reverse_editing {
             interior = None;
+        }
+        // ...or one the alignment read through as an internal stop
+        // (orfedit's EditCosts::internal_stop), whichever comes first
+        let read_through = aligned.iter().find(|a| a.2 == orfedit::codon::STOP && a.1 >= last_off).map(|a| (a.1, a.0.saturating_sub(1)));
+        if let Some(r) = read_through {
+            if interior.is_none_or(|i| r.0 < i.0) {
+                interior = Some(r);
+            }
         }
         if let Some((q, column)) = interior {
             // an early stop is a pseudogene's (or needs reverse editing):

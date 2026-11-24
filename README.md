@@ -178,6 +178,24 @@ from 96% to 98%, with more of them right in both (822 against 721, 7,140
 against 6,963).
 Templates without the column are read as before.
 
+Stops inside a gene. An alignment cannot step over a stop codon (see
+orfedit, "Where a gene ends"), which the whole-gene alignment used to do
+for a stop inside an exon, and which now, with nothing else done, comes
+out as two frame changes round the stop. `--internal-stop-penalty`
+(orfedit's; `inf`, off, by default) aligns such a stop to a profile
+column at that cost: `*` in the protein, counted in the genes table's
+`n_internal_stops`. One in the last exon, with at least half the profile
+aligned before it, is the gene's stop, as a skipped one was. Of 1-bp
+indels planted in real spliced genes, as many are found with
+`--internal-stop-penalty 20` as before any of this (mito 693 of 768,
+plastid 691 of 894), with as few calls elsewhere in those genes (32 and
+14; without the option, 102 and 39, the pairs round stops).
+`--end-margin N` (0 by default, and poa leaves it there): a gene whose
+only frame changes lie within N profile columns of its start or end is
+read in one frame. At 25 it found fewer of the planted indels (mito
+83%, plastid 64%) and called more elsewhere, so it is not the remedy
+here that it is for single-exon genes in orfedit.
+
 Junction slide. `--junction-slide N` (0, off, by default) lets junction
 refinement move each exon junction up to N bases along - bases off one
 exon and onto its neighbour, the joined length unchanged - where the
