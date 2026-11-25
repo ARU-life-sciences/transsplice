@@ -178,7 +178,10 @@ fn gap_bp(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> i64 {
 /// Classify the junction between two assigned exons *for this species*:
 /// different contigs or a strand switch is a hard trans call (physically
 /// impossible within one contiguous transcript); same contig + same strand
-/// falls back to a distance threshold.
+/// falls back to a distance threshold. On a circular contig
+/// (`circular_len`, its length) the gap is the shorter way round: exons
+/// either side of the origin lie together.
+#[allow(clippy::too_many_arguments)]
 pub fn classify_junction(
     a_contig: &str,
     a_start: i64,
@@ -189,15 +192,19 @@ pub fn classify_junction(
     b_end: i64,
     b_strand: char,
     distance_threshold: i64,
+    circular_len: Option<i64>,
 ) -> (Junction, i64) {
     if a_contig != b_contig {
         return (Junction::Trans, -1); // -1 = not a meaningful same-molecule gap
     }
+    let mut gap = gap_bp(a_start, a_end, b_start, b_end);
+    if let Some(len) = circular_len {
+        let round = len - (a_end.max(b_end) - a_start.min(b_start));
+        gap = gap.min(round.max(0));
+    }
     if a_strand != b_strand {
-        let gap = gap_bp(a_start, a_end, b_start, b_end);
         return (Junction::Trans, gap);
     }
-    let gap = gap_bp(a_start, a_end, b_start, b_end);
     if gap > distance_threshold {
         (Junction::Trans, gap)
     } else {
@@ -259,27 +266,38 @@ mod tests {
 
     #[test]
     fn strand_switch_is_hard_trans_regardless_of_distance() {
-        let (j, _) = classify_junction("ctg1", 100, 200, '+', "ctg1", 250, 300, '-', 10_000);
+        let (j, _) = classify_junction("ctg1", 100, 200, '+', "ctg1", 250, 300, '-', 10_000, None);
         assert_eq!(j, Junction::Trans);
     }
 
     #[test]
     fn nearby_same_strand_is_cis() {
-        let (j, gap) = classify_junction("ctg1", 100, 200, '+', "ctg1", 300, 400, '+', 10_000);
+        let (j, gap) = classify_junction("ctg1", 100, 200, '+', "ctg1", 300, 400, '+', 10_000, None);
         assert_eq!(j, Junction::Cis);
         assert_eq!(gap, 100);
     }
 
     #[test]
     fn far_same_strand_is_trans() {
-        let (j, gap) = classify_junction("ctg1", 100, 200, '+', "ctg1", 500_000, 500_100, '+', 10_000);
+        let (j, gap) = classify_junction("ctg1", 100, 200, '+', "ctg1", 500_000, 500_100, '+', 10_000, None);
         assert_eq!(j, Junction::Trans);
         assert_eq!(gap, 499_800);
     }
 
     #[test]
+    fn exons_either_side_of_a_circular_origin_are_cis() {
+        // a 150 kb circle: exon 1 just after the origin, exon 2 just before it
+        let (j, gap) = classify_junction("ctg1", 383, 901, '-', "ctg1", 148_422, 149_192, '-', 10_000, Some(150_000));
+        assert_eq!(j, Junction::Cis);
+        assert_eq!(gap, 150_000 - 149_192 + 383);
+        // on a linear contig the same two are far apart
+        let (j, _) = classify_junction("ctg1", 383, 901, '-', "ctg1", 148_422, 149_192, '-', 10_000, None);
+        assert_eq!(j, Junction::Trans);
+    }
+
+    #[test]
     fn different_contig_is_trans() {
-        let (j, gap) = classify_junction("ctg1", 100, 200, '+', "ctg2", 100, 200, '+', 10_000);
+        let (j, gap) = classify_junction("ctg1", 100, 200, '+', "ctg2", 100, 200, '+', 10_000, None);
         assert_eq!(j, Junction::Trans);
         assert_eq!(gap, -1);
     }

@@ -13,7 +13,7 @@ use std::fs;
 use std::path::PathBuf;
 use transsplice::candidate::RawFragment;
 use transsplice::template::GeneTemplate;
-use transsplice::{denovo_scan, finish_gene, prepare_gene, DenovoScan, DenovoTask, Prepared};
+use transsplice::{circular_contigs, denovo_scan, finish_gene, prepare_gene, Circular, DenovoScan, DenovoTask, Prepared};
 
 #[derive(Parser)]
 #[command(name = "transsplice", version, about)]
@@ -268,10 +268,12 @@ fn main() -> Result<()> {
             fasta_paths.sort_unstable();
             fasta_paths.dedup();
             let mut fastas: HashMap<String, FastaIndex> = HashMap::new();
+            let mut circulars: HashMap<String, Circular> = HashMap::new();
             for fpath in fasta_paths {
                 match FastaIndex::load(&PathBuf::from(fpath)) {
                     Ok(idx) => {
                         fastas.insert(fpath.to_string(), idx);
+                        circulars.insert(fpath.to_string(), circular_contigs(&PathBuf::from(fpath)).unwrap_or_default());
                     }
                     Err(e) => eprintln!("[warn] transsplice: failed to load fasta {}: {:#}", fpath, e),
                 }
@@ -341,9 +343,10 @@ fn main() -> Result<()> {
                 .filter_map(|(key, prepared, tasks, scans)| {
                     let template = templates.get(&key.template_dir)?;
                     let fasta_idx = fastas.get(&key.fasta)?;
+                    let circular = circulars.get(&key.fasta)?;
                     match finish_gene(
                         fasta_idx, prepared, &tasks, &scans, template, &params,
-                        junction_distance_threshold, exon_flank,
+                        junction_distance_threshold, exon_flank, circular,
                     ) {
                         Ok(outcome) => {
                             let gene_row = GeneRow {

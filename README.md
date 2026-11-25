@@ -228,7 +228,30 @@ the same gene's exon count is conserved across lineages while *which*
 junction is spliced in cis vs. trans is not (independently gained/lost
 multiple times - see the calling repo's notes). Cis/trans classification
 is a per-species output label (genomic distance + strand check), computed
-after assignment, never an input to it.
+after assignment, and an input to it only between copies of an exon that
+score the same (below).
+
+**Exons of two copies (0.3.1).** An exon in a repeat has a twin that
+scores as it does: both copies of a plastid's inverted repeat, a repeat of
+a mitogenome. The beam weighs two candidates a slot, and one fragment
+holding two exons fills only one slot, so a gene could be joined from
+exon 1 of one copy of the inverted repeat and exon 2 of the other, tens of
+kb apart on opposite strands. Now, for an exon on a junction that is not
+cis, the exon is looked for next to its neighbours (as for a short slot)
+and taken from there if the gene scores no lower and more of its
+junctions are cis. On a circular contig (oatk's `circular=true` header)
+that search, and the junction distance, go round the origin: an intron
+across the origin is cis. Over one dataset of 22,160 reconstructed genes
+(about 1,300 plastomes and 1,100 mitogenomes) against 0.3.0: plastid ndhB
+with a trans junction in 426 species -> 8, plastid rpl2 329 -> 0, cox2
+142 -> 20, nad7 63 -> 21, liverwort atp1 30 -> 5; plastid rps12's cis
+junction (exon 2 to 3) 386 -> 1,238 of 1,326. No gene scores lower; 125
+proteins changed, every one to a higher score, most of them (cox2, atp1)
+from an exon that had been only partly aligned (median 50 unaligned
+columns -> 2). Planted 1-bp indels found as before (mito 693 -> 692 of
+768, plastid 691 of 894). The 8 ndhB that stay are ferns whose exon 2
+copy next to exon 1 runs across the origin itself, which a search window
+cannot.
 
 ## Profile format
 
