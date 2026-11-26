@@ -109,6 +109,49 @@ pub fn set_junction_slide(bases: i64) {
 }
 /// Whole-gene score a slid junction must gain to be taken.
 const JUNCTION_SLIDE_MARGIN: f64 = 1.0;
+
+/// What a junction that is not cis - exons far apart or on opposite
+/// strands of one contig - costs when an exon on it is weighed against one
+/// next to its neighbour, or against none (the pass for exons of two
+/// copies, after the beam), times the share of the template's references
+/// in which that junction is cis (`junctions.tsv`; a template without it
+/// costs nothing).
+/// A setting of the whole run (`--trans-junction-penalty`); 0, the default,
+/// for none. Picking each exon's best match anywhere joins a gene from two
+/// or three diverged copies of it (plastid clpP in *Aquilegia*, without
+/// introns, in two copies 16 kb apart), or takes a chance match of a short
+/// exon tens of kb away (plastid rps12's 8-codon exon 3): either way a
+/// junction the references have cis comes out trans. The cost lets a copy
+/// next to its neighbour win when it scores within it, and leaves a slot
+/// empty where a far match adds less; a junction trans in the references
+/// (nad1, nad2, nad5, rps12 exon 1) costs nearly nothing. A junction to
+/// another contig costs the same, so that moving an exon onto its
+/// neighbour's contig is not a loss, but no exon is left out for one alone:
+/// a fragmented assembly splits genes.
+static TRANS_JUNCTION_PENALTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_trans_junction_penalty(cost: f64) {
+    let cost = if cost.is_finite() { cost.max(0.0) } else { 0.0 };
+    TRANS_JUNCTION_PENALTY.store(cost.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn trans_junction_penalty() -> f64 {
+    f64::from_bits(TRANS_JUNCTION_PENALTY.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// What `junctions` cost under `--trans-junction-penalty` (see there).
+fn junction_cost(template: &GeneTemplate, junctions: &[JunctionResult]) -> f64 {
+    let cost = trans_junction_penalty();
+    if cost == 0.0 {
+        return 0.0;
+    }
+    junctions
+        .iter()
+        .filter(|j| j.kind != "cis")
+        .filter_map(|j| template.cis_share(j.from_slot, j.to_slot))
+        .map(|share| cost * share)
+        .sum()
+}
 pub const SPLICE_MOTIF_BONUS: f64 = 20.0;
 
 /// An exon slot whose profile has at most this many columns (90 bp) is
@@ -619,19 +662,45 @@ pub fn finish_gene(
     // assemblies). For an exon on a junction that is not cis, look next to
     // its neighbours (as for a short slot, and round the origin of a
     // circular contig) and take what is found there if the gene scores no
-    // lower and more of its junctions are cis.
+    // lower and more of its junctions are cis. "No lower" is net of what
+    // its junctions cost (`--trans-junction-penalty`): a diverged copy of
+    // an exon next to its neighbour scores a little less than the best
+    // copy elsewhere, and gives way only to that. Where nothing next to
+    // the neighbours will do, the exon is left out if the gene scores
+    // higher, net of that cost, without it: a chance match tens of kb away
+    // adds less than the junction costs. (Only this pass weighs that cost;
+    // the beam and the short-slot search before it weigh whole-gene scores
+    // alone, as before. Where an intron is lost, one fragment holds both
+    // exons and fills one slot only, so the copy that is whole is not among
+    // the beam's assignments: charged there, a chimera of two copies gave
+    // way to a worse copy that this pass never saw. Charged in the
+    // short-slot search, a short exon 3 of mito cox2 was paired with a far
+    // exon 2, which a pass moving one exon at a time cannot undo: Vaccinium
+    // cox2, intronless and whole at 949, came out trans at 574.)
     if let Some(mut current) = refined.take() {
         let apart = |e: &Evaluated| e.junctions.iter().filter(|j| j.kind != "cis").count();
-        let mut tried: Vec<(usize, String, char, usize, usize)> = Vec::new();
-        'search: loop {
+        // Each round weighs every exon on a junction that is not cis and
+        // takes the best change (the first that would do, slot by slot,
+        // took exon 1 of one copy of the inverted repeat across the origin
+        // where exon 2 of the other copy, beside exon 1, scored higher):
+        // an exon found next to its neighbours, else, failing any, an exon
+        // left out (only one far from a neighbour on its own contig).
+        loop {
             if apart(&current) == 0 {
                 break;
             }
-            for si in 0..k {
+            let eps = 1e-6 * current.whole_gene_score.abs().max(1.0);
+            let on_apart = |slot: usize| current.junctions.iter().any(|j| j.kind != "cis" && (j.from_slot == slot || j.to_slot == slot));
+            // apart on one contig: far, or on the other strand
+            let on_far = |slot: usize| {
+                current.junctions.iter().any(|j| j.kind != "cis" && j.gap_bp >= 0 && (j.from_slot == slot || j.to_slot == slot))
+            };
+            // (afresh each round: what was no better beside a neighbour may
+            // be once another exon has moved)
+            let mut tried: Vec<(usize, String, char, usize, usize)> = Vec::new();
+            let mut best_swap: Option<(Assignment, Evaluated)> = None;
+            for si in (0..k).filter(|&si| on_apart(si + 1)) {
                 let slot = si + 1;
-                if !current.junctions.iter().any(|j| j.kind != "cis" && (j.from_slot == slot || j.to_slot == slot)) {
-                    continue;
-                }
                 let profile = &template.slots[si].profile;
                 for (contig, strand, start, end) in nearby_windows(fasta_idx, circular, &current.exons, slot, 3 * profile.len() as i64) {
                     let Ok(o) = scan_gene(fasta_idx, &contig, start, end, strand, profile, &denovo_params) else {
@@ -658,18 +727,37 @@ pub fn finish_gene(
                     ) else {
                         continue;
                     };
-                    let eps = 1e-6 * current.whole_gene_score.abs().max(1.0);
                     if result.exons.len() >= current.exons.len()
-                        && result.whole_gene_score >= current.whole_gene_score - eps
+                        && result.net() >= current.net() - eps
                         && apart(&result) < apart(&current)
+                        && best_swap.as_ref().is_none_or(|(_, b)| result.net() > b.net())
                     {
-                        chosen = alternative;
-                        current = result;
-                        continue 'search;
+                        best_swap = Some((alternative, result));
                     }
                 }
             }
-            break;
+            let mut best = best_swap;
+            if best.is_none() && trans_junction_penalty() > 0.0 {
+                for si in (0..k).filter(|&si| chosen.slot_to_candidate[si].is_some() && on_far(si + 1)) {
+                    let mut alternative = chosen.clone();
+                    alternative.slot_to_candidate[si] = None;
+                    let Ok(result) = evaluate_assignment(
+                        fasta_idx, &candidates, template, &alternative, &exon_params, params,
+                        &denovo_candidate_indices, junction_distance_threshold, true, &cache, circular,
+                    ) else {
+                        continue;
+                    };
+                    if result.net() > current.net() + eps
+                        && apart(&result) < apart(&current)
+                        && best.as_ref().is_none_or(|(_, b)| result.net() > b.net())
+                    {
+                        best = Some((alternative, result));
+                    }
+                }
+            }
+            let Some((alternative, result)) = best else { break };
+            chosen = alternative;
+            current = result;
         }
         refined = Some(current);
     }
@@ -778,12 +866,19 @@ struct Evaluated {
     /// Intron-motif evidence (splice_motif_evidence) summed over the
     /// junctions between adjacent slots.
     motif_bonus: f64,
+    /// What its junctions cost (`--trans-junction-penalty`).
+    junction_cost: f64,
 }
 
 impl Evaluated {
     /// What alternatives for a short slot are compared by.
     fn total(&self) -> f64 {
         self.whole_gene_score + self.motif_bonus
+    }
+
+    /// What exons of two copies are compared by.
+    fn net(&self) -> f64 {
+        self.whole_gene_score - self.junction_cost
     }
 }
 
@@ -1136,7 +1231,8 @@ fn evaluate_assignment(
         });
     }
 
-    Ok(Evaluated { exons, junctions, whole_gene_score: whole.score, whole_gene_n_edits, protein, frameshifts, motif_bonus })
+    let junction_cost = junction_cost(template, &junctions);
+    Ok(Evaluated { exons, junctions, whole_gene_score: whole.score, whole_gene_n_edits, protein, frameshifts, motif_bonus, junction_cost })
 }
 
 /// How far to move the gene's two ends, from the whole-gene alignment
@@ -1287,6 +1383,7 @@ mod tests {
             gene: "test".to_string(),
             slots: vec![SlotTemplate { profile: mkv_profile("test_exon1"), min_self_score: -100.0, lead: 0, trail: 0 }],
             whole_gene_profile: mkv_profile("test_whole"),
+            junction_cis: Vec::new(),
         };
         let fragments = vec![RawFragment { contig: "ctg1".to_string(), start: 3, end: 12, strand: '+' }];
         let params = ScanParams::default();
@@ -1337,6 +1434,7 @@ mod tests {
                 "whole",
                 &[&[(b'M', 10.0)], &[(b'K', 10.0)], &[(b'V', 10.0)], &[(b'F', 10.0)]],
             ),
+            junction_cis: Vec::new(),
         };
         let fragments = vec![
             RawFragment { contig: "ctg1".to_string(), start: 3, end: 6, strand: '+' },
@@ -1383,6 +1481,7 @@ mod tests {
                 "whole",
                 &[&[(b'M', 10.0)], &[(b'K', 10.0)], &[(b'V', 10.0)], &[(b'F', 10.0)]],
             ),
+            junction_cis: Vec::new(),
         };
         let fragments = vec![
             RawFragment { contig: "ctg1".to_string(), start: 3, end: 9, strand: '+' },
@@ -1419,6 +1518,7 @@ mod tests {
                 },
             ],
             whole_gene_profile: custom_profile("whole", &[&[(b'M', 10.0)], &[(b'K', 10.0)], &[(b'V', 10.0)], &[(b'F', 10.0)]]),
+            junction_cis: Vec::new(),
         };
         let fragments = vec![
             RawFragment { contig: "ctg1".to_string(), start: 3, end: 15, strand: '+' },
@@ -1447,6 +1547,7 @@ mod tests {
             gene: "test".to_string(),
             slots: vec![SlotTemplate { profile: custom_profile("e1", &columns), min_self_score: -100.0, lead: 0, trail: 0 }],
             whole_gene_profile: custom_profile("whole", &columns),
+            junction_cis: Vec::new(),
         }
     }
 
@@ -1522,6 +1623,7 @@ mod tests {
                 SlotTemplate { profile: profile("e2", b"WW"), min_self_score: 10.0, lead: 0, trail: 0 },
             ],
             whole_gene_profile: profile("whole", b"MKVFWW"),
+            junction_cis: Vec::new(),
         };
         let fragments = vec![
             RawFragment { contig: "ctg1".to_string(), start: 3, end: 15, strand: '+' },
@@ -1583,6 +1685,7 @@ mod tests {
                 SlotTemplate { profile: protein_profile("e2", &p2), min_self_score: 100.0, lead: 0, trail: 0 },
             ],
             whole_gene_profile: protein_profile("whole", &[p1.clone(), p2.clone()].concat()),
+            junction_cis: Vec::new(),
         };
         let fragments = vec![
             RawFragment { contig: "ctg1".to_string(), start: 480, end: 480 + e1.len() as i64, strand: '+' },
@@ -1611,6 +1714,201 @@ mod tests {
         assert_eq!(a.end - a.start, b.end - b.start);
         assert_eq!(circ.junctions[0].kind, "cis");
         assert_eq!(circ.junctions[0].gap_bp, 600 - circ.exons[0].end as i64 + a.start as i64);
+    }
+
+    /// Runs the three stages on one gene (as a batch would), junctions
+    /// cis within 100 bp.
+    fn run_gene(fasta_idx: &FastaIndex, fragments: &[RawFragment], template: &GeneTemplate) -> ReconstructionOutcome {
+        let params = ScanParams::default();
+        let (prepared, tasks) = prepare_gene(fasta_idx, fragments, template, &params, 0, 0);
+        let scans: Vec<DenovoScan> = tasks.iter().map(|t| denovo_scan(fasta_idx, template, &params, t)).collect();
+        finish_gene(fasta_idx, prepared, &tasks, &scans, template, &params, 100, 0, &Circular::new()).unwrap()
+    }
+
+    // Every test that sets the run-wide cost sets it to this, as tests run
+    // side by side (a template without junction shares costs nothing).
+    const TEST_TRANS_JUNCTION_PENALTY: f64 = 50.0;
+
+    #[test]
+    fn a_diverged_copy_next_to_the_neighbour_beats_a_better_one_far_away() {
+        // Exon 2 has two copies: a diverged one just after exon 1 (two of
+        // its 32 residues differ: 30 less) and an exact one on the other
+        // strand 1 kb away, which the fragments name - plastid clpP in
+        // Aquilegia, without introns, in two copies 16 kb apart.
+        set_trans_junction_penalty(TEST_TRANS_JUNCTION_PENALTY);
+        let e1 = [b"ATG".to_vec(), b"AAATGGCAT".repeat(10)].concat(); // M (K W H)x10
+        let e2 = b"TATTTTTGGTGT".repeat(8); // (Y F W C)x8
+        let mut near = e2.clone();
+        near[9..12].copy_from_slice(b"AAA"); // C -> K
+        near[45..48].copy_from_slice(b"AAA");
+        let mut seq = vec![b'C'; 1500];
+        seq[100..100 + e1.len()].copy_from_slice(&e1);
+        let near_at = 100 + e1.len() + 60;
+        seq[near_at..near_at + near.len()].copy_from_slice(&near);
+        let mut rc = e2.clone();
+        orfedit::fasta::revcomp_in_place(&mut rc);
+        seq[1200..1200 + rc.len()].copy_from_slice(&rc);
+        let mut sequences = HashMap::new();
+        sequences.insert("ctg1".to_string(), seq);
+        let fasta_idx = FastaIndex { sequences };
+
+        let p1 = [b"M".to_vec(), b"KWH".repeat(10)].concat();
+        let p2 = b"YFWC".repeat(8);
+        let template = |junction_cis: Vec<Option<f64>>| GeneTemplate {
+            gene: "test".to_string(),
+            slots: vec![
+                SlotTemplate { profile: protein_profile("e1", &p1), min_self_score: 100.0, lead: 0, trail: 0 },
+                SlotTemplate { profile: protein_profile("e2", &p2), min_self_score: 100.0, lead: 0, trail: 0 },
+            ],
+            whole_gene_profile: protein_profile("whole", &[p1.clone(), p2.clone()].concat()),
+            junction_cis,
+        };
+        let fragments = vec![
+            RawFragment { contig: "ctg1".to_string(), start: 100, end: 100 + e1.len() as i64, strand: '+' },
+            RawFragment { contig: "ctg1".to_string(), start: 1200, end: 1200 + e2.len() as i64, strand: '-' },
+        ];
+
+        // nothing known of the junction: the better copy, far away
+        let unknown = run_gene(&fasta_idx, &fragments, &template(Vec::new()));
+        assert_eq!((unknown.exons[1].start, unknown.exons[1].strand), (1200, '-'));
+        assert_eq!(unknown.junctions[0].kind, "trans");
+
+        // cis in the references: the copy next to exon 1
+        let cis = run_gene(&fasta_idx, &fragments, &template(vec![Some(1.0)]));
+        assert_eq!(cis.n_filled, 2);
+        let e = &cis.exons[1];
+        assert_eq!(e.strand, '+');
+        assert!(e.start >= near_at && e.end <= near_at + near.len(), "exon 2 at {}..{}", e.start, e.end);
+        assert_eq!(cis.junctions[0].kind, "cis");
+        assert!(cis.whole_gene_score < unknown.whole_gene_score);
+
+        // trans in the references: the better copy stays
+        let trans = run_gene(&fasta_idx, &fragments, &template(vec![Some(0.0)]));
+        assert_eq!((trans.exons[1].start, trans.exons[1].strand), (1200, '-'));
+    }
+
+    #[test]
+    fn an_exon_on_another_contig_is_not_left_out() {
+        // As a_short_exon_far_away_..., but the only match for exon 2 is on
+        // another contig: a fragmented assembly splits genes, so it stays.
+        set_trans_junction_penalty(TEST_TRANS_JUNCTION_PENALTY);
+        let e1 = [b"ATG".to_vec(), b"AAATGGCAT".repeat(10)].concat();
+        let mut seq1 = vec![b'C'; 400];
+        seq1[100..100 + e1.len()].copy_from_slice(&e1);
+        let mut seq2 = vec![b'C'; 400];
+        seq2[200..206].copy_from_slice(b"TGGTGG");
+        let mut sequences = HashMap::new();
+        sequences.insert("ctg1".to_string(), seq1);
+        sequences.insert("ctg2".to_string(), seq2);
+        let fasta_idx = FastaIndex { sequences };
+        let p1 = [b"M".to_vec(), b"KWH".repeat(10)].concat();
+        let template = GeneTemplate {
+            gene: "test".to_string(),
+            slots: vec![
+                SlotTemplate { profile: protein_profile("e1", &p1), min_self_score: 100.0, lead: 0, trail: 0 },
+                SlotTemplate { profile: protein_profile("e2", b"WW"), min_self_score: 10.0, lead: 0, trail: 0 },
+            ],
+            whole_gene_profile: protein_profile("whole", &[p1.clone(), b"WW".to_vec()].concat()),
+            junction_cis: vec![Some(1.0)],
+        };
+        let fragments = vec![
+            RawFragment { contig: "ctg1".to_string(), start: 100, end: 100 + e1.len() as i64, strand: '+' },
+            RawFragment { contig: "ctg2".to_string(), start: 150, end: 250, strand: '+' },
+        ];
+        let outcome = run_gene(&fasta_idx, &fragments, &template);
+        assert_eq!(outcome.n_filled, 2);
+        assert_eq!(outcome.exons[1].contig, "ctg2");
+        assert_eq!((outcome.junctions[0].kind, outcome.junctions[0].gap_bp), ("trans", -1));
+    }
+
+    #[test]
+    fn a_copy_without_the_intron_beats_a_diverged_copy_with_it() {
+        // Copy A has lost the intron: one fragment holds both exons, and
+        // fills one slot only, so A's two exons together are not among the
+        // beam's assignments. Copy B, 700 bp on, keeps the intron and
+        // differs at two residues of each exon (plastid rpl2 in Cerastium).
+        // The beam takes exon 1 of A and exon 2 of B, and the pass for two
+        // copies then finds A's exon 2 beside its exon 1. Charging the
+        // junction in the beam instead chose B whole.
+        set_trans_junction_penalty(TEST_TRANS_JUNCTION_PENALTY);
+        let e1 = [b"ATG".to_vec(), b"AAATGGCAT".repeat(10)].concat(); // M (K W H)x10
+        let e2 = b"TATTTTTGGTGT".repeat(8); // (Y F W C)x8
+        let (mut b1, mut b2) = (e1.clone(), e2.clone());
+        b1[3..6].copy_from_slice(b"GAA"); // K -> E
+        b1[30..33].copy_from_slice(b"GAA");
+        b2[9..12].copy_from_slice(b"AAA"); // C -> K
+        b2[45..48].copy_from_slice(b"AAA");
+        let a = [e1.clone(), e2.clone()].concat();
+        let b = [b1.clone(), vec![b'C'; 60], b2.clone()].concat();
+        let mut seq = vec![b'C'; 1600];
+        seq[100..100 + a.len()].copy_from_slice(&a);
+        seq[800..800 + b.len()].copy_from_slice(&b);
+        let mut sequences = HashMap::new();
+        sequences.insert("ctg1".to_string(), seq);
+        let fasta_idx = FastaIndex { sequences };
+
+        let p1 = [b"M".to_vec(), b"KWH".repeat(10)].concat();
+        let p2 = b"YFWC".repeat(8);
+        let template = GeneTemplate {
+            gene: "test".to_string(),
+            slots: vec![
+                SlotTemplate { profile: protein_profile("e1", &p1), min_self_score: 100.0, lead: 0, trail: 0 },
+                SlotTemplate { profile: protein_profile("e2", &p2), min_self_score: 100.0, lead: 0, trail: 0 },
+            ],
+            whole_gene_profile: protein_profile("whole", &[p1.clone(), p2.clone()].concat()),
+            junction_cis: vec![Some(1.0)],
+        };
+        let b2_at = 800 + b1.len() as i64 + 60;
+        let fragments = vec![
+            RawFragment { contig: "ctg1".to_string(), start: 100, end: 100 + a.len() as i64, strand: '+' },
+            RawFragment { contig: "ctg1".to_string(), start: 800, end: 800 + b1.len() as i64, strand: '+' },
+            RawFragment { contig: "ctg1".to_string(), start: b2_at, end: b2_at + b2.len() as i64, strand: '+' },
+        ];
+        let outcome = run_gene(&fasta_idx, &fragments, &template);
+        assert_eq!(outcome.n_filled, 2);
+        for e in &outcome.exons {
+            assert!(e.start >= 100 && e.end <= 100 + a.len(), "exon {} at {}..{}", e.slot, e.start, e.end);
+        }
+        assert_eq!(outcome.junctions[0].kind, "cis");
+        assert_eq!(outcome.protein, String::from_utf8([p1, p2].concat()).unwrap());
+    }
+
+    #[test]
+    fn a_short_exon_far_away_is_left_out_where_the_references_join_it_cis() {
+        // Exon 2 is two codons; nothing matches it near exon 1, and a
+        // chance TGGTGG 1 kb on fills it - plastid rps12's exon 3 in some
+        // liverworts and horsetails. Its 20 points do not pay for a
+        // junction the references have cis.
+        set_trans_junction_penalty(TEST_TRANS_JUNCTION_PENALTY);
+        let e1 = [b"ATG".to_vec(), b"AAATGGCAT".repeat(10)].concat();
+        let mut seq = vec![b'C'; 1500];
+        seq[100..100 + e1.len()].copy_from_slice(&e1);
+        seq[1200..1206].copy_from_slice(b"TGGTGG");
+        let mut sequences = HashMap::new();
+        sequences.insert("ctg1".to_string(), seq);
+        let fasta_idx = FastaIndex { sequences };
+
+        let p1 = [b"M".to_vec(), b"KWH".repeat(10)].concat();
+        let template = |junction_cis: Vec<Option<f64>>| GeneTemplate {
+            gene: "test".to_string(),
+            slots: vec![
+                SlotTemplate { profile: protein_profile("e1", &p1), min_self_score: 100.0, lead: 0, trail: 0 },
+                SlotTemplate { profile: protein_profile("e2", b"WW"), min_self_score: 10.0, lead: 0, trail: 0 },
+            ],
+            whole_gene_profile: protein_profile("whole", &[p1.clone(), b"WW".to_vec()].concat()),
+            junction_cis,
+        };
+        let fragments = vec![RawFragment { contig: "ctg1".to_string(), start: 100, end: 100 + e1.len() as i64, strand: '+' }];
+
+        let unknown = run_gene(&fasta_idx, &fragments, &template(Vec::new()));
+        assert_eq!(unknown.n_filled, 2);
+        assert_eq!(unknown.exons[1].start, 1200);
+        assert_eq!(unknown.junctions[0].kind, "trans");
+
+        let cis = run_gene(&fasta_idx, &fragments, &template(vec![Some(1.0)]));
+        assert_eq!(cis.n_filled, 1);
+        assert!(!cis.complete);
+        assert!(cis.junctions.is_empty());
     }
 
     #[test]
@@ -1643,6 +1941,7 @@ mod tests {
                 SlotTemplate { profile: slot2, min_self_score: -100.0, lead: 0, trail: 0 },
             ],
             whole_gene_profile: whole,
+            junction_cis: Vec::new(),
         };
         let fragments = vec![
             RawFragment { contig: "ctg1".to_string(), start: 0, end: 9, strand: '+' },   // M
@@ -1684,6 +1983,7 @@ mod tests {
                 SlotTemplate { profile: custom_profile("e2", &cols(30)), min_self_score: -100.0, lead: 0, trail: 0 },
             ],
             whole_gene_profile: custom_profile("whole", &cols(45)),
+            junction_cis: Vec::new(),
         };
         let fragments = vec![
             RawFragment { contig: "ctg1".to_string(), start: 3, end: 48, strand: '+' },

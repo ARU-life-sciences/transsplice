@@ -229,7 +229,8 @@ junction is spliced in cis vs. trans is not (independently gained/lost
 multiple times - see the calling repo's notes). Cis/trans classification
 is a per-species output label (genomic distance + strand check), computed
 after assignment, and an input to it only between copies of an exon that
-score the same (below).
+score the same, and, given what the references say of each junction,
+between an exon far from its neighbour and one beside it (below).
 
 **Exons of two copies (0.3.1).** An exon in a repeat has a twin that
 scores as it does: both copies of a plastid's inverted repeat, a repeat of
@@ -253,6 +254,39 @@ columns -> 2). Planted 1-bp indels found as before (mito 693 -> 692 of
 copy next to exon 1 runs across the origin itself, which a search window
 cannot.
 
+**Junctions the references have cis (0.3.2).** Two causes left genes
+joined across loci where the references join them cis. A gene in two or
+three diverged copies (plastid clpP without introns in Cyperaceae and
+*Aquilegia*): the best exon per slot, from any copy, outscores every real
+copy, so the pass above never takes the copy beside the neighbour. And a
+short exon's chance match far away (plastid rps12's 8-codon exon 3, in
+lineages that have lost its intron): its floor is near zero or below, and
+it cannot be told from a real short exon by score (nad5's 7-codon exon 3
+is trans on both sides). What tells them apart is the references. A
+template may hold `junctions.tsv` (`exon<TAB>n_cis<TAB>n_trans`, for the
+junction from exon N to N+1), and `--trans-junction-penalty P` charges a
+junction that is not cis - far apart, on the other strand, or on another
+contig - P times the share of references that have it cis. The charge
+applies in the pass for exons apart only, after the beam and the
+short-slot search, which weigh whole-gene scores alone as before (charged
+there, a chimera gave way to a worse copy, and a short exon was paired
+with the wrong neighbour). In that pass an exon beside its neighbour is
+taken if the gene scores no lower net of the charge; failing any, an exon
+far from a neighbour on its own contig is left out if the gene scores
+higher without it; each round weighs every exon apart and takes the best
+change; an exon is never left out for a junction to another contig alone.
+A junction trans in the references (nad1, nad2, nad5, plastid rps12 exon 1)
+costs nearly nothing. Without a `junctions.tsv`, or with P = 0, nothing
+changes. Over the same dataset, at P = 60, against 0.3.1: junctions the
+references have cis that came out trans within one contig 332 -> 162
+(plastid rps12 exon 2 to 3: 87 -> 0, clpP 52 -> 8; mito rps3 24 -> 6);
+junctions the references have trans 5,034 -> 5,034; no gene has more
+junctions apart. 195 proteins changed: 194 to a lower whole-gene score
+(median 15.6 lower, at most 61), one higher. Exon placement held out on
+24 RefSeq genomes is unchanged (523 of 578 exons); planted 1-bp indels in
+spliced plastid genes are found more often (691 -> 707 of 894), and in
+mito ones 692 -> 697 of 768.
+
 ## Profile format
 
 Same PSSM format as `orfedit` (plain TSV, 20 amino acid columns, one row
@@ -261,7 +295,10 @@ optionally `exon1.frame` (`lead<TAB>trail`: bases of a split codon at the
 exon's 5'/3' end, 0-2 each; absent = 0/0 - profiles must then be built
 from the exon's in-frame full codons only),
 `exon1.threshold` (a `min_self_score` floor - not an invented cutoff, see
-usage below), `exon2.pssm`, ..., and `whole_gene.pssm`.
+usage below), `exon2.pssm`, ..., and `whole_gene.pssm`; optionally
+`junctions.tsv` (`exon<TAB>n_cis<TAB>n_trans`, a header line allowed: in
+how many references the junction from exon N to N+1 is cis and in how
+many trans; read by `--trans-junction-penalty`).
 
 ## Usage
 
@@ -279,7 +316,8 @@ start end strand` - one row per raw exon fragment (multiple rows share the
 same species+gene; all of them are candidates, not just the best hit).
 
 Tunable: `--merge-distance` (default 5000bp), `--junction-distance-threshold`
-(default 10000bp), `--exon-flank` (default 60bp), plus the same
+(default 10000bp), `--exon-flank` (default 60bp), `--trans-junction-penalty`
+(default 0, none; poa uses 60), plus the same
 `--gap-open`/`--gap-extend`/`--edit-penalty` scoring knobs as `orfedit`.
 
 `min_self_score` thresholds should be computed by actually scoring a

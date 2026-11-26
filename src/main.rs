@@ -90,6 +90,15 @@ enum Command {
         /// 0, the default, for none
         #[arg(long, default_value_t = 0)]
         junction_slide: i64,
+        /// Cost, in whole-gene score, of a junction whose exons lie far
+        /// apart, on opposite strands or on different contigs, times the share of
+        /// the template's references in which it is cis (the template's
+        /// junctions.tsv; nothing without one), when an exon on it is
+        /// weighed against one next to its neighbour or against none.
+        /// Prefers a gene's exons from one copy of it, and an empty slot to
+        /// a far chance match; 0, the default, for none
+        #[arg(long, default_value_t = 0.0)]
+        trans_junction_penalty: f64,
         /// Cost of a frame change (skipping 1 or 2 bases) inside a gene;
         /// "inf" keeps every exon and the joined CDS in one reading frame
         #[arg(long, default_value_t = 20.0)]
@@ -223,10 +232,12 @@ fn main() -> Result<()> {
             junction_distance_threshold,
             exon_flank,
             junction_slide,
+            trans_junction_penalty,
             frameshifts_out,
             frameshift_penalty,
         } => {
             transsplice::set_junction_slide(junction_slide);
+            transsplice::set_trans_junction_penalty(trans_junction_penalty);
             rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().ok();
 
             let rows = parse_manifest(&manifest)?;
