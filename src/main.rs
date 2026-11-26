@@ -13,7 +13,7 @@ use std::fs;
 use std::path::PathBuf;
 use transsplice::candidate::RawFragment;
 use transsplice::template::GeneTemplate;
-use transsplice::{circular_contigs, denovo_scan, finish_gene, prepare_gene, Circular, DenovoScan, DenovoTask, Prepared};
+use transsplice::{circular_contigs, denovo_scan, finish_gene, prepare_gene, wrap_circular, Circular, DenovoScan, DenovoTask, Prepared};
 
 #[derive(Parser)]
 #[command(name = "transsplice", version, about)]
@@ -76,7 +76,9 @@ enum Command {
         internal_stop_penalty: f64,
         /// A gene whose only frame changes lie within this many profile
         /// columns of its start or end is read in one frame instead (see
-        /// orfedit; 0: frame changes kept wherever they are)
+        /// orfedit); those frame changes are still written to
+        /// --frameshifts-out, with near_end true (0: frame changes kept
+        /// wherever they are)
         #[arg(long, default_value_t = 0)]
         end_margin: usize,
         #[arg(long, default_value_t = 5000)]
@@ -282,9 +284,11 @@ fn main() -> Result<()> {
             let mut circulars: HashMap<String, Circular> = HashMap::new();
             for fpath in fasta_paths {
                 match FastaIndex::load(&PathBuf::from(fpath)) {
-                    Ok(idx) => {
+                    Ok(mut idx) => {
+                        // a circular contig's sequence goes on round its origin
+                        let names = circular_contigs(&PathBuf::from(fpath)).unwrap_or_default();
+                        circulars.insert(fpath.to_string(), wrap_circular(&mut idx, &names));
                         fastas.insert(fpath.to_string(), idx);
-                        circulars.insert(fpath.to_string(), circular_contigs(&PathBuf::from(fpath)).unwrap_or_default());
                     }
                     Err(e) => eprintln!("[warn] transsplice: failed to load fasta {}: {:#}", fpath, e),
                 }
@@ -306,11 +310,12 @@ fn main() -> Result<()> {
                 .map(|(key, frags)| {
                     let template = templates.get(&key.template_dir)?;
                     let fasta_idx = fastas.get(&key.fasta)?;
+                    let circular = circulars.get(&key.fasta)?;
                     let fragments: Vec<RawFragment> = frags
                         .iter()
                         .map(|f| RawFragment { contig: f.contig.clone(), start: f.start, end: f.end, strand: f.strand })
                         .collect();
-                    Some(prepare_gene(fasta_idx, &fragments, template, &params, merge_distance, exon_flank))
+                    Some(prepare_gene(fasta_idx, &fragments, template, &params, merge_distance, exon_flank, circular))
                 })
                 .collect();
             let (prepared, tasks): (Vec<Option<Prepared>>, Vec<Vec<DenovoTask>>) = prepared
@@ -384,9 +389,9 @@ fn main() -> Result<()> {
                                 })
                             }).collect();
                             let shift_rows = outcome.frameshifts.iter().map(|f| format!(
-                                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                                 key.species, key.organelle, key.gene, f.slot, f.contig, f.start, f.end, f.n_bases,
-                                f.profile_column, f.window_start, f.window_end
+                                f.profile_column, f.window_start, f.window_end, f.near_end
                             )).collect();
                             Some((gene_row, exon_rows, junction_rows, edit_rows, shift_rows))
                         }
@@ -401,7 +406,7 @@ fn main() -> Result<()> {
             write_outputs(&genes_out, &exons_out, &junctions_out, &edits_out, &results)?;
             if let Some(path) = &frameshifts_out {
                 let mut w = String::from(
-                    "species\torganelle\tgene\tslot\tcontig\tstart\tend\tn_bases\tprofile_column\twindow_start\twindow_end\n",
+                    "species\torganelle\tgene\tslot\tcontig\tstart\tend\tn_bases\tprofile_column\twindow_start\twindow_end\tnear_end\n",
                 );
                 for (_, _, _, _, rows) in &results {
                     rows.iter().for_each(|r| w.push_str(r));

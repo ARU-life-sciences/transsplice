@@ -13,13 +13,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use template::GeneTemplate;
 
-/// Names of the circular contigs in a FASTA: oatk's headers say
-/// `circular=true` (or false). A gene's exons either side of such a
-/// contig's origin lie together (see `classify_junction`), and an exon is
-/// looked for next to its neighbour across the origin.
-pub type Circular = HashSet<String>;
+/// The circular contigs of a FASTA and their lengths (`wrap_circular`). A
+/// gene's exons either side of such a contig's origin lie together (see
+/// `classify_junction`), an exon is looked for next to its neighbour
+/// across the origin, and an exon may itself cross it.
+pub type Circular = HashMap<String, i64>;
 
-pub fn circular_contigs(path: &Path) -> Result<Circular> {
+/// Names of the circular contigs in a FASTA: oatk's headers say
+/// `circular=true` (or false).
+pub fn circular_contigs(path: &Path) -> Result<HashSet<String>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     Ok(text
         .lines()
@@ -29,12 +31,52 @@ pub fn circular_contigs(path: &Path) -> Result<Circular> {
         .collect())
 }
 
-/// A circular contig's length, for `classify_junction`.
-fn circular_len(fasta_idx: &FastaIndex, circular: &Circular, contig: &str) -> Option<i64> {
-    if !circular.contains(contig) {
-        return None;
+/// How far (bp) past its end a circular contig's sequence is continued
+/// from its start: room for an exon across the origin, the window it is
+/// looked for in beside its neighbour (NEARBY_WINDOW), and two fragments
+/// merged across it (`--merge-distance`).
+pub const WRAP_BP: usize = 20_000;
+
+/// Continue each named contig's sequence past its end with its first
+/// WRAP_BP bases (all of it, if shorter), so that a window can run round
+/// the origin: a position p >= length is position p - length. Returns the
+/// contigs' own lengths, which everything that needs a contig's length
+/// takes from here, not from the longer sequence.
+pub fn wrap_circular(fasta_idx: &mut FastaIndex, names: &HashSet<String>) -> Circular {
+    let mut out = Circular::new();
+    for name in names {
+        if let Some(seq) = fasta_idx.sequences.get_mut(name) {
+            let n = seq.len();
+            seq.extend_from_within(..WRAP_BP.min(n));
+            out.insert(name.clone(), n as i64);
+        }
     }
-    fasta_idx.sequences.get(contig).map(|s| s.len() as i64)
+    out
+}
+
+/// A circular contig's own length.
+fn circular_len(circular: &Circular, contig: &str) -> Option<i64> {
+    circular.get(contig).copied()
+}
+
+/// Whether any exon runs past its circular contig's end, across the origin.
+fn crosses_origin(exons: &[ExonResult], circular: &Circular) -> bool {
+    exons.iter().any(|e| circular_len(circular, &e.contig).is_some_and(|n| e.end as i64 > n))
+}
+
+/// A contig's own length: a circular one's, else its sequence's.
+fn contig_len(fasta_idx: &FastaIndex, circular: &Circular, contig: &str) -> Option<i64> {
+    circular_len(circular, contig).or_else(|| fasta_idx.sequences.get(contig).map(|s| s.len() as i64))
+}
+
+/// [start, end) found past a circular contig's end (in its continuation,
+/// `wrap_circular`) moved back by its length; one across the origin keeps
+/// its end past the length.
+fn canonical(circular: &Circular, contig: &str, start: i64, end: i64) -> (i64, i64) {
+    match circular_len(circular, contig) {
+        Some(n) if start >= n => (start - n, end - n),
+        _ => (start, end),
+    }
 }
 
 /// What `evaluate_assignment` needs from one `scan_gene` call, kept so the
@@ -279,6 +321,10 @@ pub struct GeneFrameshift {
     /// (orfedit's frameshift window), clipped to the exon.
     pub window_start: usize,
     pub window_end: usize,
+    /// Within `--end-margin` columns of the gene's start or end: reported,
+    /// as orfedit reports its own, but the gene is read in one frame
+    /// there (it ends at its own stop).
+    pub near_end: bool,
 }
 
 /// A frame change this close (bases) to an exon end is taken as the
@@ -320,9 +366,10 @@ pub fn reconstruct_gene(
     junction_distance_threshold: i64,
     exon_flank: i64,
 ) -> Result<ReconstructionOutcome> {
-    let (prepared, tasks) = prepare_gene(fasta_idx, fragments, template, params, merge_distance, exon_flank);
+    let circular = Circular::new();
+    let (prepared, tasks) = prepare_gene(fasta_idx, fragments, template, params, merge_distance, exon_flank, &circular);
     let scans: Vec<DenovoScan> = tasks.iter().map(|t| denovo_scan(fasta_idx, template, params, t)).collect();
-    finish_gene(fasta_idx, prepared, &tasks, &scans, template, params, junction_distance_threshold, exon_flank, &Circular::new())
+    finish_gene(fasta_idx, prepared, &tasks, &scans, template, params, junction_distance_threshold, exon_flank, &circular)
 }
 
 /// One whole-contig de novo scan a gene needs: an empty slot's profile
@@ -365,9 +412,10 @@ pub fn prepare_gene(
     params: &ScanParams,
     merge_distance: i64,
     exon_flank: i64,
+    circular: &Circular,
 ) -> (Prepared, Vec<DenovoTask>) {
     let k = template.slots.len();
-    let candidates = build_candidates(fragments, merge_distance);
+    let candidates = build_candidates(fragments, merge_distance, circular);
 
     let exon_params = ScanParams { flank: exon_flank, end_margin: 0, ..*params }; // (the margin is the whole gene's)
     let cache = GeneCache::default();
@@ -406,7 +454,8 @@ pub fn prepare_gene(
     let mut tasks: Vec<DenovoTask> = Vec::new();
     for si in (0..k).filter(|&si| assignment.slot_to_candidate[si].is_none() || is_short(&template.slots[si])) {
         for contig in &contigs {
-            let Some(len) = fasta_idx.sequences.get(contig).map(|s| s.len() as i64) else { continue };
+            // (the contig itself: not round its origin again)
+            let Some(len) = contig_len(fasta_idx, circular, contig) else { continue };
             for strand in ['+', '-'] {
                 tasks.push(DenovoTask { slot: si, contig: contig.clone(), len, strand });
             }
@@ -445,6 +494,11 @@ pub fn finish_gene(
     let k = template.slots.len();
     let Prepared { mut candidates, mut scores, mut assignment, cache } = prepared;
     let exon_params = ScanParams { flank: exon_flank, end_margin: 0, ..*params }; // (the margin is the whole gene's)
+    // The end margin reads the gene chosen, at the end; the exons are chosen
+    // without it (see there).
+    let margin_params = params;
+    let search_params = ScanParams { end_margin: 0, ..*params };
+    let params = &search_params;
     let floors: Vec<f64> = template.slots.iter().map(|s| s.min_self_score).collect();
     let mut denovo_candidate_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
@@ -455,7 +509,12 @@ pub fn finish_gene(
             .iter()
             .zip(scans)
             .filter(|(task, _)| task.slot == si)
-            .filter_map(|(task, scan)| scan.map(|(score, start, end)| (score, start, end, task)))
+            .filter_map(|(task, scan)| {
+                scan.map(|(score, start, end)| {
+                    let (start, end) = canonical(circular, &task.contig, start, end);
+                    (score, start, end, task)
+                })
+            })
             .filter(|h| h.0 >= floors[si])
             .collect();
         hits.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -576,7 +635,19 @@ pub fn finish_gene(
         ) else {
             continue;
         };
-        if best.as_ref().is_none_or(|(_, prev)| result.whole_gene_score > prev.whole_gene_score) {
+        // On a tie, a gene within its contig over one across the origin:
+        // where one copy of a plastid's inverted repeat runs across the
+        // origin (an exon cut by it, read whole since 0.3.3), the two copies
+        // make the same protein, and the one across the origin is the
+        // harder to use (as 0.3.2 chose: rpl2 in 152 plastomes).
+        let better = |prev: &Evaluated| {
+            let eps = 1e-9 * prev.whole_gene_score.abs().max(1.0);
+            result.whole_gene_score > prev.whole_gene_score + eps
+                || (result.whole_gene_score >= prev.whole_gene_score - eps
+                    && crosses_origin(&prev.exons, circular)
+                    && !crosses_origin(&result.exons, circular))
+        };
+        if best.as_ref().is_none_or(|(_, prev)| better(prev)) {
             best = Some((bi, result));
         }
     }
@@ -607,13 +678,8 @@ pub fn finish_gene(
                     continue;
                 };
                 if o.score >= floors[si] {
-                    let new = Candidate {
-                        contig,
-                        start: o.corrected_start as i64,
-                        end: o.corrected_end as i64,
-                        strand,
-                        provenance: "nearby".to_string(),
-                    };
+                    let (start, end) = canonical(circular, &contig, o.corrected_start as i64, o.corrected_end as i64);
+                    let new = Candidate { contig, start, end, strand, provenance: "nearby".to_string() };
                     alternatives.push(add_candidate(
                         &mut candidates, &mut scores, &mut denovo_candidate_indices, new, si, o.score, k,
                     ));
@@ -690,6 +756,14 @@ pub fn finish_gene(
                 break;
             }
             let eps = 1e-6 * current.whole_gene_score.abs().max(1.0);
+            // the better of two changes: net of the junction cost, and on a
+            // tie the one within its contig (as in the beam: two copies of
+            // the inverted repeat beside each other's exons, one across the
+            // origin)
+            let preferable = |r: &Evaluated, b: &Evaluated| {
+                r.net() > b.net() + eps
+                    || (r.net() >= b.net() - eps && crosses_origin(&b.exons, circular) && !crosses_origin(&r.exons, circular))
+            };
             let on_apart = |slot: usize| current.junctions.iter().any(|j| j.kind != "cis" && (j.from_slot == slot || j.to_slot == slot));
             // apart on one contig: far, or on the other strand
             let on_far = |slot: usize| {
@@ -709,12 +783,13 @@ pub fn finish_gene(
                     if o.score < floors[si] {
                         continue;
                     }
-                    let place = (si, contig.clone(), strand, o.corrected_start, o.corrected_end);
-                    if tried.contains(&place) || current.exons.iter().any(|e| e.slot == slot && e.contig == contig && e.strand == strand && e.start == o.corrected_start && e.end == o.corrected_end) {
+                    let (start, end) = canonical(circular, &contig, o.corrected_start as i64, o.corrected_end as i64);
+                    let place = (si, contig.clone(), strand, start as usize, end as usize);
+                    if tried.contains(&place) || current.exons.iter().any(|e| e.slot == slot && e.contig == contig && e.strand == strand && e.start == start as usize && e.end == end as usize) {
                         continue;
                     }
                     tried.push(place);
-                    let new = Candidate { contig, start: o.corrected_start as i64, end: o.corrected_end as i64, strand, provenance: "nearby".to_string() };
+                    let new = Candidate { contig, start, end, strand, provenance: "nearby".to_string() };
                     let ci = add_candidate(&mut candidates, &mut scores, &mut denovo_candidate_indices, new, si, o.score, k);
                     if chosen.slot_to_candidate.contains(&Some(ci)) {
                         continue;
@@ -730,13 +805,111 @@ pub fn finish_gene(
                     if result.exons.len() >= current.exons.len()
                         && result.net() >= current.net() - eps
                         && apart(&result) < apart(&current)
-                        && best_swap.as_ref().is_none_or(|(_, b)| result.net() > b.net())
+                        && best_swap.as_ref().is_none_or(|(_, b)| preferable(&result, b))
                     {
                         best_swap = Some((alternative, result));
                     }
                 }
             }
             let mut best = best_swap;
+            // A run of exons moved together. Where no exon beside a
+            // neighbour will do - one copy of a repeat lacks it - the other
+            // copy may hold the whole gene, and moving one exon at a time
+            // only moves the break: Dryopteris nad2 and nad7 took exons 1-3
+            // from one copy of a repeat and exon 4 from the other, which
+            // holds all four and, given alone, makes the same protein all
+            // cis. For each junction apart, the exons on one side of it are
+            // found again one by one beside the other side's, outward from
+            // the junction, each beside the one found before; the run is
+            // taken by the same rule as one exon.
+            if best.is_none() {
+                let bare = |e: &ExonResult| ExonResult {
+                    slot: e.slot,
+                    provenance: e.provenance.clone(),
+                    contig: e.contig.clone(),
+                    start: e.start,
+                    end: e.end,
+                    strand: e.strand,
+                    score: e.score,
+                    edits: Vec::new(),
+                    via_denovo: e.via_denovo,
+                    phase: e.phase,
+                };
+                let filled: Vec<usize> = current.exons.iter().map(|e| e.slot).collect();
+                for j in current.junctions.iter().filter(|j| j.kind != "cis") {
+                    for keep_after in [true, false] {
+                        // the side kept, and the slots found again, outward
+                        let (mut placed, order): (Vec<ExonResult>, Vec<usize>) = if keep_after {
+                            (
+                                current.exons.iter().filter(|e| e.slot >= j.to_slot).map(bare).collect(),
+                                filled.iter().copied().filter(|&s| s <= j.from_slot).rev().collect(),
+                            )
+                        } else {
+                            (
+                                current.exons.iter().filter(|e| e.slot <= j.from_slot).map(bare).collect(),
+                                filled.iter().copied().filter(|&s| s >= j.to_slot).collect(),
+                            )
+                        };
+                        if order.len() < 2 {
+                            continue; // one exon: the swaps above
+                        }
+                        let mut alternative = chosen.clone();
+                        let mut whole = true;
+                        for &slot in &order {
+                            let si = slot - 1;
+                            let profile = &template.slots[si].profile;
+                            let mut found: Option<(f64, String, char, i64, i64)> = None;
+                            for (contig, strand, start, end) in nearby_windows(fasta_idx, circular, &placed, slot, 3 * profile.len() as i64) {
+                                let Ok(o) = scan_gene(fasta_idx, &contig, start, end, strand, profile, &denovo_params) else {
+                                    continue;
+                                };
+                                if o.score < floors[si] || found.as_ref().is_some_and(|f| f.0 >= o.score) {
+                                    continue;
+                                }
+                                let (s, e) = canonical(circular, &contig, o.corrected_start as i64, o.corrected_end as i64);
+                                found = Some((o.score, contig, strand, s, e));
+                            }
+                            let Some((score, contig, strand, s, e)) = found else {
+                                whole = false;
+                                break;
+                            };
+                            placed.push(ExonResult {
+                                slot,
+                                provenance: "nearby".to_string(),
+                                contig: contig.clone(),
+                                start: s as usize,
+                                end: e as usize,
+                                strand,
+                                score,
+                                edits: Vec::new(),
+                                via_denovo: true,
+                                phase: 0,
+                            });
+                            let new = Candidate { contig, start: s, end: e, strand, provenance: "nearby".to_string() };
+                            alternative.slot_to_candidate[si] =
+                                Some(add_candidate(&mut candidates, &mut scores, &mut denovo_candidate_indices, new, si, score, k));
+                        }
+                        let used: Vec<usize> = alternative.slot_to_candidate.iter().flatten().copied().collect();
+                        let injective = used.iter().enumerate().all(|(i, c)| !used[..i].contains(c));
+                        if !whole || !injective || alternative.slot_to_candidate == chosen.slot_to_candidate {
+                            continue;
+                        }
+                        let Ok(result) = evaluate_assignment(
+                            fasta_idx, &candidates, template, &alternative, &exon_params, params,
+                            &denovo_candidate_indices, junction_distance_threshold, true, &cache, circular,
+                        ) else {
+                            continue;
+                        };
+                        if result.exons.len() >= current.exons.len()
+                            && result.net() >= current.net() - eps
+                            && apart(&result) < apart(&current)
+                            && best.as_ref().is_none_or(|(_, b)| preferable(&result, b))
+                        {
+                            best = Some((alternative, result));
+                        }
+                    }
+                }
+            }
             if best.is_none() && trans_junction_penalty() > 0.0 {
                 for si in (0..k).filter(|&si| chosen.slot_to_candidate[si].is_some() && on_far(si + 1)) {
                     let mut alternative = chosen.clone();
@@ -762,6 +935,20 @@ pub fn finish_gene(
         refined = Some(current);
     }
 
+    // The gene chosen, read in one frame where its only frame changes lie
+    // within `end_margin` columns of either end (those still reported, as
+    // near_end). Applied to every alignment the search weighed, the margin
+    // changed which exons were chosen: of 894 1-bp indels planted in spliced
+    // plastid genes 612 were found, against 707 without it, and calls
+    // elsewhere in those genes went from 14 to 69.
+    if margin_params.end_margin > 0 {
+        if let Ok(r) = evaluate_assignment(
+            fasta_idx, &candidates, template, &chosen, &exon_params, margin_params,
+            &denovo_candidate_indices, junction_distance_threshold, true, &cache, circular,
+        ) {
+            refined = Some(r);
+        }
+    }
     let Evaluated { exons, junctions, whole_gene_score, whole_gene_n_edits, protein, frameshifts, .. } =
         refined.unwrap_or(unrefined);
 
@@ -811,24 +998,24 @@ fn nearby_windows(fasta_idx: &FastaIndex, circular: &Circular, exons: &[ExonResu
         }
         windows.push((n.contig.clone(), n.strand, s, e));
     }
-    // on a circular contig a window past either end goes on round the origin
-    let mut wrapped: Vec<(String, char, i64, i64)> = Vec::new();
+    // On a circular contig a window past either end runs on round the
+    // origin, as one window into the contig's continuation (`wrap_circular`;
+    // what is found there goes back by `canonical`). Cut in two at the
+    // origin, as before 0.3.3, it could not hold an exon across the origin
+    // itself: fern ndhB, whose exon 2 crosses it beside exon 1, came from
+    // the other copy of the inverted repeat.
+    let mut out: Vec<(String, char, i64, i64)> = Vec::new();
     for (contig, strand, s, e) in windows {
-        let len = circular_len(fasta_idx, circular, &contig);
-        let n = fasta_idx.sequences.get(&contig).map_or(i64::MAX, |q| q.len() as i64);
-        if let Some(len) = len {
-            if s < 0 {
-                wrapped.push((contig.clone(), strand, (len + s).max(0), len));
-            }
-            if e > len {
-                wrapped.push((contig.clone(), strand, 0, (e - len).min(len)));
-            }
-        }
-        wrapped.push((contig, strand, s.max(0), e.min(n)));
+        let seq_len = fasta_idx.sequences.get(&contig).map_or(i64::MAX, |q| q.len() as i64);
+        let (s, e) = match circular_len(circular, &contig) {
+            Some(len) if s < 0 => (s + len, e + len),
+            _ => (s, e),
+        };
+        out.push((contig, strand, s.max(0), e.min(seq_len)));
     }
-    wrapped.retain(|w| w.3 - w.2 >= min_len);
-    wrapped.dedup();
-    wrapped
+    out.retain(|w| w.3 - w.2 >= min_len);
+    out.dedup();
+    out
 }
 
 /// `scan_gene` of candidate `ci` against slot `si`'s profile with the
@@ -1083,15 +1270,23 @@ fn evaluate_assignment(
         .enumerate()
         .map(|(i, p)| {
             let (s, e) = p.span(ext5[i], ext3[i]);
+            // an exon wholly past a circular contig's end, in its
+            // continuation, is the one at its start
+            let (s2, e2) = canonical(circular, &p.contig, s.max(0), e.max(0));
+            let shift = (s.max(0) - s2) as usize;
+            let mut edits = p.edits;
+            for x in edits.iter_mut() {
+                x.genomic_pos -= shift;
+            }
             ExonResult {
                 slot: p.slot,
                 provenance: p.provenance,
                 contig: p.contig,
-                start: s.max(0) as usize,
-                end: e.max(0) as usize,
+                start: s2 as usize,
+                end: e2 as usize,
                 strand: p.strand,
                 score: p.score,
-                edits: p.edits,
+                edits,
                 via_denovo: p.via_denovo,
                 phase: ext5[i].rem_euclid(3) as usize,
             }
@@ -1105,7 +1300,7 @@ fn evaluate_assignment(
     // changes are allowed (params.frameshift_penalty) and kept only with
     // sound alignment either side (orfedit::frameshifts_supported), as in
     // orfedit's own single-exon scan.
-    let align_exons = |exons: &[ExonResult]| -> Result<(Vec<u8>, Vec<(usize, usize)>, orfedit::align::NtAlignResult)> {
+    let align_exons = |exons: &[ExonResult]| -> Result<(Vec<u8>, Vec<(usize, usize)>, orfedit::align::NtAlignResult, Vec<orfedit::align::Frameshift>)> {
         let mut concat: Vec<u8> = Vec::new();
         let mut offsets = Vec::with_capacity(exons.len()); // (concat start, exon index)
         for (i, e) in exons.iter().enumerate() {
@@ -1125,14 +1320,19 @@ fn evaluate_assignment(
         // start or end buy only its first or last few columns, and cannot
         // be told from a gene that starts or ends differently there (see
         // orfedit): if those are all it has, the gene is read in one frame.
+        // They are still reported (`near_end`), as orfedit's are: dropped
+        // altogether, 7 and 13 points of planted-indel recall in spliced mito
+        // and plastid genes went with them.
         let n = template.whole_gene_profile.len();
         let margin = params.end_margin.min(n / 4);
+        let mut near_end = Vec::new();
         if !whole.frameshifts.is_empty() && whole.frameshifts.iter().all(|f| f.after_column < margin || f.after_column + margin > n) {
+            near_end = std::mem::take(&mut whole.frameshifts);
             whole = align_whole(f64::INFINITY);
         }
-        Ok((concat, offsets, whole))
+        Ok((concat, offsets, whole, near_end))
     };
-    let (concat, mut offsets, mut whole) = align_exons(&exons)?;
+    let (concat, mut offsets, mut whole, mut near_end) = align_exons(&exons)?;
     // Gene ends (the chosen assignment only): start the first exon at the
     // start codon and end the last at the stop codon, then align again.
     if refine_junctions && !exons.is_empty() {
@@ -1165,7 +1365,7 @@ fn evaluate_assignment(
                 let (start, end) = (e.start, e.end);
                 e.edits.retain(|x| x.genomic_pos >= start && x.genomic_pos < end);
             }
-            (_, offsets, whole) = align_exons(&exons)?;
+            (_, offsets, whole, near_end) = align_exons(&exons)?;
         }
     }
 
@@ -1177,7 +1377,7 @@ fn evaluate_assignment(
             &a.contig, a.start as i64, a.end as i64, a.strand,
             &b.contig, b.start as i64, b.end as i64, b.strand,
             junction_distance_threshold,
-            circular_len(fasta_idx, circular, &a.contig),
+            circular_len(circular, &a.contig),
         );
         junctions.push(JunctionResult { from_slot: a.slot, to_slot: b.slot, kind: kind.as_str(), gap_bp: gap });
         if b.slot == a.slot + 1 {
@@ -1203,7 +1403,7 @@ fn evaluate_assignment(
         }
     }
     let mut frameshifts = Vec::new();
-    for f in &whole.frameshifts {
+    for (f, near_end) in whole.frameshifts.iter().map(|f| (f, false)).chain(near_end.iter().map(|f| (f, true))) {
         // the exon holding the skipped bases, and their offset within it
         let Some(&(off, i)) = offsets.iter().rev().find(|(o, _)| *o <= f.sense_pos) else { continue };
         let e = &exons[i];
@@ -1228,6 +1428,7 @@ fn evaluate_assignment(
             profile_column: f.after_column,
             window_start,
             window_end,
+            near_end,
         });
     }
 
@@ -1674,7 +1875,9 @@ mod tests {
         seq[480..480 + e1.len()].copy_from_slice(&e1);
         let mut sequences = HashMap::new();
         sequences.insert("ctg1".to_string(), seq);
-        let fasta_idx = FastaIndex { sequences };
+        let linear_idx = FastaIndex { sequences };
+        let mut circular_idx = FastaIndex { sequences: linear_idx.sequences.clone() };
+        let circular = wrap_circular(&mut circular_idx, &["ctg1".to_string()].into_iter().collect());
 
         let p1 = [b"M".to_vec(), b"KWH".repeat(10)].concat();
         let p2 = b"YFWC".repeat(8);
@@ -1692,21 +1895,20 @@ mod tests {
             RawFragment { contig: "ctg1".to_string(), start: 250, end: 250 + e2.len() as i64, strand: '-' },
         ];
         let params = ScanParams::default();
-        let run = |circular: &Circular| {
-            let (prepared, tasks) = prepare_gene(&fasta_idx, &fragments, &template, &params, 0, 0);
-            let scans: Vec<DenovoScan> = tasks.iter().map(|t| denovo_scan(&fasta_idx, &template, &params, t)).collect();
-            finish_gene(&fasta_idx, prepared, &tasks, &scans, &template, &params, 100, 0, circular).unwrap()
+        let run = |fasta_idx: &FastaIndex, circular: &Circular| {
+            let (prepared, tasks) = prepare_gene(fasta_idx, &fragments, &template, &params, 0, 0, circular);
+            let scans: Vec<DenovoScan> = tasks.iter().map(|t| denovo_scan(fasta_idx, &template, &params, t)).collect();
+            finish_gene(fasta_idx, prepared, &tasks, &scans, &template, &params, 100, 0, circular).unwrap()
         };
 
         // a linear contig: nothing after exon 1, so the far copy stays
-        let linear = run(&Circular::new());
+        let linear = run(&linear_idx, &Circular::new());
         assert_eq!(linear.n_filled, 2);
         assert_eq!((linear.exons[1].start, linear.exons[1].strand), (250, '-'));
         assert_eq!(linear.junctions[0].kind, "trans");
 
         // circular: exon 2 found round the origin, the same protein, cis
-        let circular: Circular = ["ctg1".to_string()].into_iter().collect();
-        let circ = run(&circular);
+        let circ = run(&circular_idx, &circular);
         assert_eq!(circ.protein, linear.protein);
         let (a, b) = (&circ.exons[1], &linear.exons[1]);
         assert_eq!(a.strand, '+');
@@ -1716,11 +1918,150 @@ mod tests {
         assert_eq!(circ.junctions[0].gap_bp, 600 - circ.exons[0].end as i64 + a.start as i64);
     }
 
+    #[test]
+    fn an_exon_across_the_origin_is_found_beside_its_neighbour() {
+        // As fern ndhB: exon 2's copy beside exon 1 runs across the origin
+        // of the circular contig (bases 590..600 then 0..86); the fragments
+        // name only the other copy, on the other strand mid-contig.
+        let e1 = [b"ATG".to_vec(), b"AAATGGCAT".repeat(10)].concat(); // M (K W H)x10
+        let e2 = b"TATTTTTGGTGT".repeat(8); // (Y F W C)x8, 96 bp
+        let mut seq = vec![b'C'; 600];
+        seq[590..600].copy_from_slice(&e2[..10]);
+        seq[..86].copy_from_slice(&e2[10..]);
+        let mut rc = e2.clone();
+        orfedit::fasta::revcomp_in_place(&mut rc);
+        seq[250..250 + rc.len()].copy_from_slice(&rc);
+        seq[480..480 + e1.len()].copy_from_slice(&e1);
+        let mut sequences = HashMap::new();
+        sequences.insert("ctg1".to_string(), seq);
+        let mut fasta_idx = FastaIndex { sequences };
+        let circular = wrap_circular(&mut fasta_idx, &["ctg1".to_string()].into_iter().collect());
+        assert_eq!(circular["ctg1"], 600);
+
+        let p1 = [b"M".to_vec(), b"KWH".repeat(10)].concat();
+        let p2 = b"YFWC".repeat(8);
+        let template = GeneTemplate {
+            gene: "test".to_string(),
+            slots: vec![
+                SlotTemplate { profile: protein_profile("e1", &p1), min_self_score: 100.0, lead: 0, trail: 0 },
+                SlotTemplate { profile: protein_profile("e2", &p2), min_self_score: 100.0, lead: 0, trail: 0 },
+            ],
+            whole_gene_profile: protein_profile("whole", &[p1.clone(), p2.clone()].concat()),
+            junction_cis: Vec::new(),
+        };
+        let fragments = vec![
+            RawFragment { contig: "ctg1".to_string(), start: 480, end: 480 + e1.len() as i64, strand: '+' },
+            RawFragment { contig: "ctg1".to_string(), start: 250, end: 250 + e2.len() as i64, strand: '-' },
+        ];
+        let params = ScanParams::default();
+        let run = |fasta_idx: &FastaIndex, circular: &Circular| {
+            let (prepared, tasks) = prepare_gene(fasta_idx, &fragments, &template, &params, 0, 0, circular);
+            let scans: Vec<DenovoScan> = tasks.iter().map(|t| denovo_scan(fasta_idx, &template, &params, t)).collect();
+            finish_gene(fasta_idx, prepared, &tasks, &scans, &template, &params, 100, 0, circular).unwrap()
+        };
+        let out = run(&fasta_idx, &circular);
+
+        assert_eq!(out.n_filled, 2);
+        let e = &out.exons[1];
+        assert_eq!(e.strand, '+');
+        // across the origin: it ends past the contig's length
+        assert!(e.start >= 590 && e.start < 600 && e.end > 600 && e.end <= 686, "exon 2 at {}..{}", e.start, e.end);
+        assert_eq!(out.junctions[0].kind, "cis");
+
+        // the same as with exon 2 whole beside exon 1, on a linear contig
+        let mut seq = fasta_idx.sequences["ctg1"][..600].to_vec();
+        seq[..86].fill(b'C');
+        seq.extend(vec![b'C'; 100]);
+        seq[590..686].copy_from_slice(&e2);
+        let mut sequences = HashMap::new();
+        sequences.insert("ctg1".to_string(), seq);
+        let control = run(&FastaIndex { sequences }, &Circular::new());
+        assert_eq!(control.junctions[0].kind, "cis");
+        assert_eq!(out.protein, control.protein);
+        assert_eq!((e.start, e.end), (control.exons[1].start, control.exons[1].end));
+    }
+
+    #[test]
+    fn a_run_of_exons_moves_to_the_copy_that_holds_the_whole_gene() {
+        // Two copies of a repeat, further apart than an exon is looked for
+        // beside its neighbour: A (at 100) holds exons 1 and 2, B (at 8000)
+        // all three. The fragments name exons 1-2 of A and exon 3 of B, so
+        // one exon at a time only moves the break.
+        let e1 = [b"ATG".to_vec(), b"AAATGGCAT".repeat(10)].concat(); // M (K W H)x10
+        let e2 = b"TATTTTTGGTGT".repeat(8); // (Y F W C)x8
+        let e3 = b"GATGAACCTGGT".repeat(8); // (D E P G)x8
+        let intron = b"GTAAGTTTTTTTTTTTTTTTTTTTTTTTAG".to_vec();
+        let copy_a = [e1.clone(), intron.clone(), e2.clone()].concat();
+        let copy_b = [e1.clone(), intron.clone(), e2.clone(), intron.clone(), e3.clone()].concat();
+        let mut seq = vec![b'C'; 9000];
+        seq[100..100 + copy_a.len()].copy_from_slice(&copy_a);
+        seq[8000..8000 + copy_b.len()].copy_from_slice(&copy_b);
+        let mut sequences = HashMap::new();
+        sequences.insert("ctg1".to_string(), seq);
+        let fasta_idx = FastaIndex { sequences };
+        let (p1, p2, p3) = ([b"M".to_vec(), b"KWH".repeat(10)].concat(), b"YFWC".repeat(8), b"DEPG".repeat(8));
+        let template = GeneTemplate {
+            gene: "test".to_string(),
+            slots: vec![
+                SlotTemplate { profile: protein_profile("e1", &p1), min_self_score: 100.0, lead: 0, trail: 0 },
+                SlotTemplate { profile: protein_profile("e2", &p2), min_self_score: 100.0, lead: 0, trail: 0 },
+                SlotTemplate { profile: protein_profile("e3", &p3), min_self_score: 100.0, lead: 0, trail: 0 },
+            ],
+            whole_gene_profile: protein_profile("whole", &[p1.clone(), p2.clone(), p3.clone()].concat()),
+            junction_cis: Vec::new(),
+        };
+        let b3 = 8000 + (e1.len() + e2.len() + 2 * intron.len()) as i64;
+        let fragments = vec![
+            RawFragment { contig: "ctg1".to_string(), start: 100, end: 100 + e1.len() as i64, strand: '+' },
+            RawFragment { contig: "ctg1".to_string(), start: 100 + (e1.len() + intron.len()) as i64, end: 100 + copy_a.len() as i64, strand: '+' },
+            RawFragment { contig: "ctg1".to_string(), start: b3, end: b3 + e3.len() as i64, strand: '+' },
+        ];
+        let params = ScanParams::default();
+        let circular = Circular::new();
+        let (prepared, tasks) = prepare_gene(&fasta_idx, &fragments, &template, &params, 0, 0, &circular);
+        let scans: Vec<DenovoScan> = tasks.iter().map(|t| denovo_scan(&fasta_idx, &template, &params, t)).collect();
+        let out = finish_gene(&fasta_idx, prepared, &tasks, &scans, &template, &params, 100, 0, &circular).unwrap();
+        assert_eq!(out.n_filled, 3);
+        assert!(out.junctions.iter().all(|j| j.kind == "cis"), "{:?}", out.junctions.iter().map(|j| j.kind).collect::<Vec<_>>());
+        assert!(out.exons.iter().all(|e| e.start >= 8000), "{:?}", out.exons.iter().map(|e| e.start).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn fragments_of_an_exon_across_the_origin_are_merged() {
+        // the same exon 2 across the origin, named by its two pieces
+        let e2 = b"TATTTTTGGTGT".repeat(8);
+        let mut seq = vec![b'C'; 600];
+        seq[590..600].copy_from_slice(&e2[..10]);
+        seq[..86].copy_from_slice(&e2[10..]);
+        let mut sequences = HashMap::new();
+        sequences.insert("ctg1".to_string(), seq);
+        let mut fasta_idx = FastaIndex { sequences };
+        let circular = wrap_circular(&mut fasta_idx, &["ctg1".to_string()].into_iter().collect());
+        let p2 = b"YFWC".repeat(8);
+        let template = GeneTemplate {
+            gene: "test".to_string(),
+            slots: vec![SlotTemplate { profile: protein_profile("e2", &p2), min_self_score: 100.0, lead: 0, trail: 0 }],
+            whole_gene_profile: protein_profile("whole", &p2),
+            junction_cis: Vec::new(),
+        };
+        let fragments = vec![
+            RawFragment { contig: "ctg1".to_string(), start: 0, end: 86, strand: '+' },
+            RawFragment { contig: "ctg1".to_string(), start: 590, end: 600, strand: '+' },
+        ];
+        let params = ScanParams::default();
+        let (prepared, tasks) = prepare_gene(&fasta_idx, &fragments, &template, &params, 100, 0, &circular);
+        let scans: Vec<DenovoScan> = tasks.iter().map(|t| denovo_scan(&fasta_idx, &template, &params, t)).collect();
+        let out = finish_gene(&fasta_idx, prepared, &tasks, &scans, &template, &params, 100, 0, &circular).unwrap();
+        assert_eq!(out.n_filled, 1);
+        assert_eq!((out.exons[0].start, out.exons[0].end), (590, 686));
+        assert_eq!(out.protein, String::from_utf8(p2).unwrap());
+    }
+
     /// Runs the three stages on one gene (as a batch would), junctions
     /// cis within 100 bp.
     fn run_gene(fasta_idx: &FastaIndex, fragments: &[RawFragment], template: &GeneTemplate) -> ReconstructionOutcome {
         let params = ScanParams::default();
-        let (prepared, tasks) = prepare_gene(fasta_idx, fragments, template, &params, 0, 0);
+        let (prepared, tasks) = prepare_gene(fasta_idx, fragments, template, &params, 0, 0, &Circular::new());
         let scans: Vec<DenovoScan> = tasks.iter().map(|t| denovo_scan(fasta_idx, template, &params, t)).collect();
         finish_gene(fasta_idx, prepared, &tasks, &scans, template, &params, 100, 0, &Circular::new()).unwrap()
     }
@@ -1999,5 +2340,52 @@ mod tests {
         // single-frame: no frameshift, and exon 2 is cut short
         let outcome = reconstruct_gene(&fasta_idx, &fragments, &template, &ScanParams::default(), 0, 1000, 0).unwrap();
         assert!(outcome.frameshifts.is_empty());
+    }
+
+    #[test]
+    fn a_frameshift_near_the_gene_end_is_reported_and_not_read_through() {
+        // as above, the extra A after exon 2's 27th codon: 3 columns from the end
+        let half = "ATGAAAGTTTGGTTT".repeat(3);
+        let mut seq = b"CCC".to_vec();
+        seq.extend(half.as_bytes()); // exon1: 3..48
+        seq.extend(b"GTGCGTTTTTTTTTTTTTTTTTTTTAT"); // intron: 48..75
+        seq.extend("ATGAAAGTTTGGTTT".repeat(5).as_bytes()); // exon2 codons 1-25: 75..150
+        seq.extend(b"ATGAA"); // 150..155, then the extra base
+        seq.push(b'A'); // 155
+        seq.extend(b"AGTTTGGTTTTAACCC");
+        let mut sequences = HashMap::new();
+        sequences.insert("ctg1".to_string(), seq);
+        let fasta_idx = FastaIndex { sequences };
+        let cols = |n: usize| -> Vec<&'static [(u8, f64)]> {
+            let one: [&'static [(u8, f64)]; 5] =
+                [&[(b'M', 5.0)], &[(b'K', 5.0)], &[(b'V', 5.0)], &[(b'W', 5.0)], &[(b'F', 5.0)]];
+            (0..n).map(|i| one[i % 5]).collect()
+        };
+        let template = GeneTemplate {
+            gene: "test".to_string(),
+            slots: vec![
+                SlotTemplate { profile: custom_profile("e1", &cols(15)), min_self_score: -100.0, lead: 0, trail: 0 },
+                SlotTemplate { profile: custom_profile("e2", &cols(30)), min_self_score: -100.0, lead: 0, trail: 0 },
+            ],
+            whole_gene_profile: custom_profile("whole", &cols(45)),
+            junction_cis: Vec::new(),
+        };
+        let fragments = vec![
+            RawFragment { contig: "ctg1".to_string(), start: 3, end: 48, strand: '+' },
+            RawFragment { contig: "ctg1".to_string(), start: 75, end: 172, strand: '+' },
+        ];
+        // no margin: the frame change is followed and not marked
+        let params = ScanParams { frameshift_penalty: 10.0, ..ScanParams::default() };
+        let followed = reconstruct_gene(&fasta_idx, &fragments, &template, &params, 0, 1000, 0).unwrap();
+        assert_eq!(followed.frameshifts.len(), 1);
+        assert!(!followed.frameshifts[0].near_end);
+        // a margin: reported as near the end, and the gene read in one frame
+        let params = ScanParams { frameshift_penalty: 10.0, end_margin: 10, ..ScanParams::default() };
+        let near = reconstruct_gene(&fasta_idx, &fragments, &template, &params, 0, 1000, 0).unwrap();
+        assert_eq!(near.frameshifts.len(), 1);
+        let f = &near.frameshifts[0];
+        assert!(f.near_end);
+        assert_eq!((f.slot, f.start, f.end, f.n_bases), (followed.frameshifts[0].slot, followed.frameshifts[0].start, followed.frameshifts[0].end, 1));
+        assert_ne!(near.protein, followed.protein);
     }
 }

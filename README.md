@@ -74,8 +74,9 @@ an exon with an indel is still placed whole and the joined CDS aligned
 through it. Each frame change in the whole-gene alignment is mapped back
 to its exon and genomic position and written to `--frameshifts-out`
 (`slot`, `contig`, `start`/`end` of the 1 or 2 skipped bases, `n_bases`,
-whole-gene `profile_column`, and `window_start`/`window_end`, the
-stretch it could equally well sit in, clipped to the exon). A frame
+whole-gene `profile_column`, `window_start`/`window_end`, the
+stretch it could equally well sit in, clipped to the exon, and, since
+0.3.3, `near_end`: true for one `--end-margin` keeps out of the gene). A frame
 change within 3 bp of an exon end is taken as the junction being a base
 or two off, not reported. The joined exons are now aligned in frame 0
 only (0.2.1 let that alignment start in any of the three frames), which
@@ -194,7 +195,14 @@ plastid 691 of 894), with as few calls elsewhere in those genes (32 and
 only frame changes lie within N profile columns of its start or end is
 read in one frame. At 25 it found fewer of the planted indels (mito
 83%, plastid 64%) and called more elsewhere, so it is not the remedy
-here that it is for single-exon genes in orfedit.
+here that it is for single-exon genes in orfedit. Since 0.3.3 the margin
+reads only the gene chosen, after the search (applied to every alignment
+the search weighed, it changed which exons were chosen), and the frame
+changes it keeps out are still reported, `near_end` true, as orfedit's
+are. Plastid planted indels found at 25: 691 of 894, against 612 before
+and 707 without a margin, with as few calls elsewhere as without (14):
+still short of no margin, since a frame change can fall outside the exon
+once the gene ends at its own stop.
 
 Junction slide. `--junction-slide N` (0, off, by default) lets junction
 refinement move each exon junction up to N bases along - bases off one
@@ -252,7 +260,7 @@ from an exon that had been only partly aligned (median 50 unaligned
 columns -> 2). Planted 1-bp indels found as before (mito 693 -> 692 of
 768, plastid 691 of 894). The 8 ndhB that stay are ferns whose exon 2
 copy next to exon 1 runs across the origin itself, which a search window
-cannot.
+could not (it can since 0.3.3, below).
 
 **Junctions the references have cis (0.3.2).** Two causes left genes
 joined across loci where the references join them cis. A gene in two or
@@ -286,6 +294,54 @@ junctions apart. 195 proteins changed: 194 to a lower whole-gene score
 24 RefSeq genomes is unchanged (523 of 578 exons); planted 1-bp indels in
 spliced plastid genes are found more often (691 -> 707 of 894), and in
 mito ones 692 -> 697 of 768.
+
+**Round the origin, and copies holding the whole gene (0.3.3).** A
+circular contig's sequence is now continued past its end with its first
+20 kb (`WRAP_BP`), so a window beside a neighbouring exon runs on round
+the origin as one window, and an exon can cross the origin itself. Cut
+in two at the origin, as before, a window could not hold such an exon:
+fern ndhB took exon 2 from the other copy of the inverted repeat, 65 kb
+away on the other strand, because its copy beside exon 1 crosses the
+origin. Two fragments that reach the contig's two ends (within 30 bp) are
+merged into one candidate across the origin; only those two, since
+merging whole runs of fragments either side made one candidate of every
+exon of a liverwort cox1 and crowded an exon's own out of its slot. An
+exon found wholly in the continuation is moved back to the contig's start;
+one across the origin keeps its end past the contig's length, as poa
+writes such genes (GFF3's convention for circular sequences). On a tie,
+a gene within its contig is preferred over one across the origin: the
+two copies of a plastid's inverted repeat make the same protein, and the
+one across the origin is the harder to use.
+
+The pass for exons apart also moves a run of exons together. Where no
+exon beside a neighbour will do - one copy of a repeat lacks it - the
+other copy may hold the whole gene, and moving one exon at a time only
+moves the break (Dryopteris nad2 and nad7: exons 1-3 from one copy of a
+mitochondrial repeat and the last from the other, which holds all of
+them). For each junction apart, the exons on one side are found again
+one by one beside the other side's, outward from the junction, and the
+run is taken by the same rule as one exon. Of 139 genes in the dataset
+below with a junction apart that the references have cis, 98 have no
+whole cis copy in their assembly at all (tblastn chains of >= 70%
+identity covering 90% of the protein), so the assembly holds them in
+pieces; given only the cis copy's fragments, 15 of the other 41 made an
+all-cis gene scoring the same, higher, or within the junction cost.
+
+Over the same dataset against 0.3.2: junctions the references have cis
+that came out trans within one contig 162 -> 133 (fern plastid ndhB 6 ->
+0, mito nad7 25 -> 16, nad2 25 -> 22, nad1 14 -> 11, cox2 12 -> 9,
+plastid clpP 8 -> 6); junctions the references have trans 5,034 ->
+5,031 (three Geranium nad1, intronless from exon 2 to 5, now read from
+that one locus); complete genes 21,616 as before, and none with fewer
+exons. 59 proteins changed, 54 to a higher whole-gene score (median 149
+higher: exons cut at the origin, now whole - mito ccmFc, nad1, nad2 and
+nad4 of mosses and liverworts, Sphagnum inundatum nad2 exon 2 925 ->
+1629), five lower, each now from one copy: Carex rariflora and C.
+vaginata clpP from their intronless copy (55 and 11 lower), Vandenboschia
+cox2 (39 lower), and two horsetail rps12, exon 3 beside exon 2, its
+intron lost. Planted 1-bp indels found
+as before (plastid 707 of 894, mito 697 of 768); exon placement held out
+on 24 RefSeq genomes as before (525 of 578 with the options poa passes).
 
 ## Profile format
 
